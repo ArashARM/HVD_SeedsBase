@@ -18,21 +18,21 @@ class ContinuousVoronoiDecoder(nn.Module):
 
     def __init__(
         self,
-        eps: float = 1e-8,
-        solve_reg: float = 1e-6,
-        min_seed_dist: float = 1e-3,
-        min_area: float = 1e-5,
-        tau_close: float = 0.01,
-        tau_area: float = 0.01,
-        tau_voronoi: float = 0.01,
-        tau_box: float = 0.01,
-        tau_trim: float = 0.01,
-        tau_vertex_weight: float = 0.02,
-        tau_keff: float = 1.0,
-        use_seed_weight_gate: bool = True,
-        use_trim_activity: bool = True,
-        return_xyz: bool = True,
-        empty_circle_margin: float | None = None,
+        eps: float = 1e-8, #Min value to avoid dead gradients.
+        solve_reg: float = 1e-6, #Regularization for solving the linear system
+        min_seed_dist: float = 1e-3, #Min acceptable distance between seeds.
+        min_area: float = 1e-5, #Min triangle area before considering a triple valid.
+        tau_close: float = 0.01, #Softness of the seed-distance validity gate. 
+        tau_area: float = 0.01, #Softness of the area validity gate.
+        tau_voronoi: float = 0.01, #Softness of the empty-circle (Voronoi) gate.
+        tau_box: float = 0.01, #Softness of the UV boundary gate.
+        tau_trim: float = 0.01, #Softness of CAD trim-region gate.
+        tau_vertex_weight: float = 0.02, #Temperature for seed-weight computation around a vertex.
+        tau_keff: float = 1.0, #Width of the effective-neighbor-count acceptance bell around 3.
+        use_seed_weight_gate: bool = True, #Whether to apply the keff gate.
+        use_trim_activity: bool = True, #Whether to use CAD trim activity.
+        return_xyz: bool = True, #Whether XYZ coordinates should be returned if a CAD domain is provided.
+        empty_circle_margin: float | None = None, #Margin used in empty-circle validation. If None, becomes 0.5 * tau_voronoi.
     ):
         super().__init__()
         self.eps = float(eps)
@@ -258,9 +258,9 @@ class ContinuousVoronoiDecoder(nn.Module):
 
     def forward(
         self,
-        seeds_uv: torch.Tensor,
-        seed_activity: torch.Tensor | None = None,
-        cad_domain: Any | None = None,
+        seeds_uv: torch.Tensor, #Tensor of seed points in normalized UV space, shape [S, 2].
+        seed_activity: torch.Tensor | None = None, #Optional tensor of seed activity values, shape [S]
+        cad_domain: Any | None = None, #Optional CAD/domain object used for trimming and UV-to-XYZ conversion.
         u_periodic: bool = False,
         v_periodic: bool = False,
         return_xyz: bool | None = None,
@@ -273,6 +273,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise TypeError("seeds_uv must be a floating point tensor.")
 
         S = seeds_uv.shape[0]
+        # make or possible combinations
         triples = self.make_triples(S, seeds_uv.device)
         want_xyz = self.return_xyz if return_xyz is None else bool(return_xyz)
 
