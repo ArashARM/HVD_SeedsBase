@@ -5,6 +5,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.spatial import Voronoi, voronoi_plot_2d, cKDTree
 
 
 class ContinuousVoronoiDecoder(nn.Module):
@@ -30,9 +33,18 @@ class ContinuousVoronoiDecoder(nn.Module):
         tau_vertex_weight: float = 0.02, #Temperature for seed-weight computation around a vertex.
         tau_keff: float = 1.0, #Width of the effective-neighbor-count acceptance bell around 3.
         use_seed_weight_gate: bool = True, #Whether to apply the keff gate.
+        use_close_gate: bool = False, #Whether to include close-seed rejection in alpha.
         use_trim_activity: bool = True, #Whether to use CAD trim activity.
         return_xyz: bool = True, #Whether XYZ coordinates should be returned if a CAD domain is provided.
         empty_circle_margin: float | None = None, #Margin used in empty-circle validation. If None, becomes 0.5 * tau_voronoi.
+        duplicate_merge_sigma: float = 0.01,
+        duplicate_effect_temp_ratio: float = 0.20,
+        duplicate_effect_strength: float = 6.0,
+        duplicate_effect_floor: float = 5e-2,
+        seed_activity_sharpness: float = 1.0,
+        seed_activity_threshold: float = 0.5,
+        domain_effect_floor: float = 1e-8,
+        hard_seed_mask: bool = False,
     ):
         super().__init__()
         self.eps = float(eps)
@@ -47,8 +59,17 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.tau_vertex_weight = float(tau_vertex_weight)
         self.tau_keff = float(tau_keff)
         self.use_seed_weight_gate = bool(use_seed_weight_gate)
+        self.use_close_gate = bool(use_close_gate)
         self.use_trim_activity = bool(use_trim_activity)
         self.return_xyz = bool(return_xyz)
+        self.duplicate_merge_sigma = float(duplicate_merge_sigma)
+        self.duplicate_effect_temp_ratio = float(duplicate_effect_temp_ratio)
+        self.duplicate_effect_strength = float(duplicate_effect_strength)
+        self.duplicate_effect_floor = float(duplicate_effect_floor)
+        self.seed_activity_sharpness = float(seed_activity_sharpness)
+        self.seed_activity_threshold = float(seed_activity_threshold)
+        self.domain_effect_floor = float(domain_effect_floor)
+        self.hard_seed_mask = bool(hard_seed_mask)
         if empty_circle_margin is None:
             empty_circle_margin = 0.5 * tau_voronoi
 
@@ -87,6 +108,148 @@ class ContinuousVoronoiDecoder(nn.Module):
     ) -> torch.Tensor:
         diff = self.periodic_difference(a, b, u_periodic, v_periodic)
         return torch.sqrt((diff * diff).sum(dim=-1) + self.eps)
+
+    def _sharpen_seed_activity(self, weights: torch.Tensor) -> torch.Tensor:
+        weights = weights.clamp(0.0, 1.0)
+        if self.seed_activity_sharpness == 1.0:
+            return weights
+
+        sharpness = torch.as_tensor(
+            self.seed_activity_sharpness,
+            device=weights.device,
+            dtype=weights.dtype,
+        ).clamp_min(self.eps)
+
+        threshold = torch.as_tensor(
+            self.seed_activity_threshold,
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+
+        temp = (0.25 / sharpness).clamp_min(self.eps)
+        raw = torch.sigmoid((weights - threshold) / temp)
+        lo = torch.sigmoid((torch.zeros_like(threshold) - threshold) / temp)
+        hi = torch.sigmoid((torch.ones_like(threshold) - threshold) / temp)
+
+        return ((raw - lo) / (hi - lo).clamp_min(self.eps)).clamp(0.0, 1.0)
+
+    def _seed_domain_activity(
+        self,
+        seeds_uv: torch.Tensor,
+        cad_domain: Any | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cad_domain is None:
+            ones = torch.ones((seeds_uv.shape[0],), dtype=seeds_uv.dtype, device=seeds_uv.device)
+            return ones, ones
+
+        if hasattr(cad_domain, "sample_trim_sdf"):
+            sdf = cad_domain.sample_trim_sdf(seeds_uv)
+            sdf = torch.as_tensor(sdf, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            domain_weight = torch.sigmoid(sdf / self._tau_tensor(self.tau_trim, seeds_uv))
+        elif hasattr(cad_domain, "smooth_inside_activity"):
+            domain_weight = cad_domain.smooth_inside_activity(seeds_uv, tau=self.tau_trim)
+            domain_weight = torch.as_tensor(domain_weight, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            sdf = torch.empty((0,), dtype=seeds_uv.dtype, device=seeds_uv.device)
+        else:
+            ones = torch.ones((seeds_uv.shape[0],), dtype=seeds_uv.dtype, device=seeds_uv.device)
+            return ones, torch.empty((0,), dtype=seeds_uv.dtype, device=seeds_uv.device)
+
+        domain_weight = domain_weight.clamp(0.0, 1.0)
+        domain_floor = torch.as_tensor(
+            self.domain_effect_floor,
+            dtype=seeds_uv.dtype,
+            device=seeds_uv.device,
+        )
+        domain_activity = domain_floor + (1.0 - domain_floor) * domain_weight
+        return domain_activity.clamp(0.0, 1.0), sdf
+
+    def _duplicate_seed_activity(
+        self,
+        seeds_uv: torch.Tensor,
+        u_periodic: bool,
+        v_periodic: bool,
+    ) -> torch.Tensor:
+        S = seeds_uv.shape[0]
+        if S <= 1:
+            return torch.ones((S,), dtype=seeds_uv.dtype, device=seeds_uv.device)
+
+        d = self.periodic_distance(
+            seeds_uv[:, None, :],
+            seeds_uv[None, :, :],
+            u_periodic,
+            v_periodic,
+        )
+
+        radius = torch.as_tensor(
+            self.duplicate_merge_sigma,
+            dtype=seeds_uv.dtype,
+            device=seeds_uv.device,
+        ).clamp_min(self.eps)
+
+        temp = (radius * float(self.duplicate_effect_temp_ratio)).clamp_min(self.eps)
+
+        soft_close = torch.sigmoid((radius - d) / temp)
+        eye = torch.eye(S, dtype=torch.bool, device=seeds_uv.device)
+        soft_close = soft_close.masked_fill(eye, 0.0)
+
+        lower_priority = torch.tril(
+            torch.ones((S, S), dtype=seeds_uv.dtype, device=seeds_uv.device),
+            diagonal=-1,
+        )
+
+        suppress_mass = (soft_close * lower_priority).sum(dim=1)
+
+        raw_duplicate_weight = torch.exp(
+            -float(self.duplicate_effect_strength) * suppress_mass
+        )
+
+        duplicate_floor = torch.as_tensor(
+            self.duplicate_effect_floor,
+            dtype=seeds_uv.dtype,
+            device=seeds_uv.device,
+        )
+
+        duplicate_weight = duplicate_floor + (1.0 - duplicate_floor) * raw_duplicate_weight
+        return duplicate_weight.clamp(0.0, 1.0)
+
+    def _seed_activation_state(
+        self,
+        seeds_uv: torch.Tensor,
+        cad_domain: Any | None = None,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+        hard_seed_mask: bool | None = None,
+    ) -> dict[str, torch.Tensor]:
+
+        use_hard_seed_mask = (
+            self.hard_seed_mask
+            if hard_seed_mask is None
+            else hard_seed_mask
+        )
+
+        domain_activity, seed_sdf = self._seed_domain_activity(seeds_uv, cad_domain)
+
+        duplicate_weight = self._duplicate_seed_activity(
+            seeds_uv,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
+
+        weights = duplicate_weight * domain_activity
+        weights = self._sharpen_seed_activity(weights)
+
+        if use_hard_seed_mask:
+            hard_active = (domain_activity > self.seed_activity_threshold) & (
+                duplicate_weight > self.seed_activity_threshold
+            )
+            weights = weights * hard_active.to(seeds_uv.dtype)
+
+        return {
+            "weights": weights.clamp(0.0, 1.0),
+            "domain_activity": domain_activity.clamp(0.0, 1.0),
+            "duplicate_weight": duplicate_weight.clamp(0.0, 1.0),
+            "seed_sdf": seed_sdf,
+        }
 
     def unwrap_triple_seeds(
         self,
@@ -191,7 +354,42 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         g_trim = cad_domain.smooth_inside_activity(P_uv, tau=self.tau_trim)
         return g_trim.to(dtype=P_uv.dtype, device=P_uv.device)
+    def vertex_soft_competition_gate(
+        self,
+        P_uv: torch.Tensor,
+        alpha_base: torch.Tensor,
+        sigma: float = 0.01,
+        temperature: float = 0.05,
+        floor: float = 0.05,
+    ) -> torch.Tensor:
+        """
+        Softly suppress nearby duplicate vertices using alpha-based competition.
 
+        P_uv: [M, 2]
+        alpha_base: [M], alpha before competition
+        returns: [M] gate in [floor, 1]
+        """
+
+        M = P_uv.shape[0]
+        if M == 0:
+            return torch.empty((0,), dtype=P_uv.dtype, device=P_uv.device)
+
+        d = torch.cdist(P_uv, P_uv)  # [M, M]
+
+        # nearby candidates compete
+        sim = torch.exp(-(d / sigma).pow(2))  # [M, M]
+
+        # candidate strength comes from alpha, not index
+        score = torch.log(alpha_base.clamp_min(self.eps)) / temperature  # [M]
+
+        # for each vertex i, compare it against nearby vertices j
+        logits = score[None, :] + torch.log(sim.clamp_min(self.eps))
+
+        ownership = torch.softmax(logits, dim=1)  # [M, M]
+
+        gate = ownership.diagonal()
+
+        return floor + (1.0 - floor) * gate.clamp(0.0, 1.0)
     def empty_circle_gate(
         self,
         seeds_uv: torch.Tensor,
@@ -231,6 +429,21 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         log_g = F.logsigmoid((delta + margin) / tau).sum(dim=-1)
         return torch.exp(log_g)
+    
+    def vertex_soft_nms_alpha(
+        self,
+        P_uv: torch.Tensor,
+        alpha_base: torch.Tensor,
+        sigma: float = 0.012,
+    ) -> torch.Tensor:
+        d = torch.cdist(P_uv, P_uv)
+        sim = torch.exp(-(d / sigma).pow(2))
+
+        denom = sim @ alpha_base.clamp_min(self.eps)
+        alpha_nms = alpha_base / denom.clamp_min(self.eps)
+
+        return alpha_nms.clamp(0.0, 1.0)
+
 
     def seed_weight_vertex_gate(
         self,
@@ -277,6 +490,27 @@ class ContinuousVoronoiDecoder(nn.Module):
         triples = self.make_triples(S, seeds_uv.device)
         want_xyz = self.return_xyz if return_xyz is None else bool(return_xyz)
 
+        if seed_activity is None:
+            seed_state = self._seed_activation_state(
+                seeds_uv=seeds_uv,
+                cad_domain=cad_domain,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+                hard_seed_mask=None,
+            )
+            act = seed_state["weights"]
+        else:
+            act = torch.as_tensor(seed_activity, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            if act.ndim != 1 or act.shape[0] != S:
+                raise ValueError(f"seed_activity must have shape [S], got {tuple(act.shape)}.")
+            act = act.clamp(0.0, 1.0)
+            seed_state = {
+                "weights": act,
+                "domain_activity": torch.ones_like(act),
+                "duplicate_weight": torch.ones_like(act),
+                "seed_sdf": torch.empty((0,), dtype=seeds_uv.dtype, device=seeds_uv.device),
+            }
+
         if triples.numel() == 0:
             return self._empty_output(
                 seeds_uv,
@@ -285,6 +519,7 @@ class ContinuousVoronoiDecoder(nn.Module):
                 want_xyz,
                 u_periodic,
                 v_periodic,
+                seed_state,
             )
 
         qi, qj, qk = self.unwrap_triple_seeds(seeds_uv, triples, u_periodic, v_periodic)
@@ -295,21 +530,20 @@ class ContinuousVoronoiDecoder(nn.Module):
             v_periodic,
         )
 
-        if seed_activity is None:
-            g_seed = torch.ones((triples.shape[0],), dtype=seeds_uv.dtype, device=seeds_uv.device)
-        else:
-            seed_activity = torch.as_tensor(seed_activity, dtype=seeds_uv.dtype, device=seeds_uv.device)
-            if seed_activity.ndim != 1 or seed_activity.shape[0] != S:
-                raise ValueError(
-                    f"seed_activity must have shape [S], got {tuple(seed_activity.shape)}."
-                )
-            act = torch.clamp(seed_activity, 0.0, 1.0)
-            g_seed = act[triples[:, 0]] * act[triples[:, 1]] * act[triples[:, 2]]
+        g_seed = (
+            act[triples[:, 0]]
+            * act[triples[:, 1]]
+            * act[triples[:, 2]]
+        )
 
         g_close = self.close_gate(qi, qj, qk)
         g_area = self.area_gate(qi, qj, qk)
         g_box = self.box_gate(P_uv, u_periodic, v_periodic)
         g_trim = self.trim_gate(P_uv, cad_domain)
+        if cad_domain is None:
+            g_domain = g_box
+        else:
+            g_domain = g_trim
         g_vor = self.empty_circle_gate(seeds_uv, P_uv, triples, u_periodic, v_periodic)
 
         if self.use_seed_weight_gate:
@@ -332,15 +566,24 @@ class ContinuousVoronoiDecoder(nn.Module):
                 device=seeds_uv.device,
             )
 
-        alpha = (
+        alpha_base = (
             g_seed
-            * g_close
             * g_area
-            * g_box
-            * g_trim
+            * g_domain
             * g_vor
-            * g_keff
         )
+        if self.use_close_gate:
+            alpha = alpha * g_close
+        g_compete = self.vertex_soft_competition_gate(
+            P_uv,
+            alpha_base,
+            sigma=0.01,
+            temperature=0.05,
+            floor=0.05,
+        )
+
+        alpha = alpha_base * g_compete
+        
         alpha = torch.nan_to_num(alpha, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         P_uv = torch.nan_to_num(P_uv, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -369,6 +612,14 @@ class ContinuousVoronoiDecoder(nn.Module):
             "u_periodic": bool(u_periodic),
             "v_periodic": bool(v_periodic),
         }
+        diagnostics.update({
+            "seed_activity_weights": seed_state["weights"],
+            "seed_domain_activity": seed_state["domain_activity"],
+            "seed_duplicate_weight": seed_state["duplicate_weight"],
+            "seed_sdf": seed_state["seed_sdf"],
+            "triple_seed_activity": g_seed,
+
+        })
 
         out: dict[str, Any] = {
             "vertices_uv": P_uv,
@@ -392,9 +643,18 @@ class ContinuousVoronoiDecoder(nn.Module):
         want_xyz: bool,
         u_periodic: bool,
         v_periodic: bool,
+        seed_state: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, Any]:
         empty = torch.empty((0,), dtype=seeds_uv.dtype, device=seeds_uv.device)
         vertices_uv = torch.empty((0, 2), dtype=seeds_uv.dtype, device=seeds_uv.device)
+        if seed_state is None:
+            ones = torch.ones((seeds_uv.shape[0],), dtype=seeds_uv.dtype, device=seeds_uv.device)
+            seed_state = {
+                "weights": ones,
+                "domain_activity": ones,
+                "duplicate_weight": ones,
+                "seed_sdf": empty,
+            }
         validity = {
             "seed": empty,
             "close": empty,
@@ -429,6 +689,13 @@ class ContinuousVoronoiDecoder(nn.Module):
             "u_periodic": bool(u_periodic),
             "v_periodic": bool(v_periodic),
         }
+        diagnostics.update({
+            "seed_activity_weights": seed_state["weights"],
+            "seed_domain_activity": seed_state["domain_activity"],
+            "seed_duplicate_weight": seed_state["duplicate_weight"],
+            "seed_sdf": seed_state["seed_sdf"],
+            "triple_seed_activity": empty,
+        })
         out: dict[str, Any] = {
             "vertices_uv": vertices_uv,
             "alpha": empty,
@@ -439,6 +706,229 @@ class ContinuousVoronoiDecoder(nn.Module):
         if cad_domain is not None and want_xyz:
             out["vertices_xyz"] = torch.empty((0, 3), dtype=seeds_uv.dtype, device=seeds_uv.device)
         return out
+    
+    def plot_voronoi_debug(
+    self,
+    seeds_uv,
+    out=None,
+    cad_domain=None,
+    alpha_threshold=0.5,
+    trim_res=300,
+    miss_tol=0.02,
+):
+        if out is None:
+            out = self(
+                seeds_uv,
+                cad_domain=cad_domain,
+                u_periodic=False,
+                v_periodic=False,
+                return_xyz=False,
+            )
 
+        seeds_np = seeds_uv.detach().cpu().numpy()
+        vertices = out["vertices_uv"]
+        alpha = out["alpha"]
+
+        vertices_np = vertices.detach().cpu().numpy()
+        alpha_np = alpha.detach().cpu().numpy()
+
+        keep = alpha > alpha_threshold
+        pred_np = vertices[keep].detach().cpu().numpy()
+        pred_alpha_np = alpha[keep].detach().cpu().numpy()
+
+        vor = Voronoi(seeds_np)
+        exact_np = vor.vertices
+
+        inside_exact = (
+            (exact_np[:, 0] >= 0.0) & (exact_np[:, 0] <= 1.0) &
+            (exact_np[:, 1] >= 0.0) & (exact_np[:, 1] <= 1.0)
+        )
+
+        if cad_domain is not None and hasattr(cad_domain, "smooth_inside_activity"):
+            exact_t = torch.as_tensor(exact_np, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            trim_exact = cad_domain.smooth_inside_activity(exact_t, tau=self.tau_trim)
+            inside_exact = inside_exact & (trim_exact.detach().cpu().numpy() > alpha_threshold)
+
+        exact_inside_np = exact_np[inside_exact]
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        def draw_trim(ax):
+            if cad_domain is None or not hasattr(cad_domain, "smooth_inside_activity"):
+                return
+            u = torch.linspace(0, 1, trim_res, device=seeds_uv.device, dtype=seeds_uv.dtype)
+            v = torch.linspace(0, 1, trim_res, device=seeds_uv.device, dtype=seeds_uv.dtype)
+            uu, vv = torch.meshgrid(u, v, indexing="xy")
+            grid = torch.stack([uu.reshape(-1), vv.reshape(-1)], dim=-1)
+            activity = cad_domain.smooth_inside_activity(grid, tau=self.tau_trim)
+            activity = activity.reshape(trim_res, trim_res).detach().cpu().numpy()
+            ax.contourf(
+                np.linspace(0, 1, trim_res),
+                np.linspace(0, 1, trim_res),
+                activity,
+                levels=[0.5, 1.0],
+                alpha=0.15,
+            )
+            ax.contour(
+                np.linspace(0, 1, trim_res),
+                np.linspace(0, 1, trim_res),
+                activity,
+                levels=[0.5],
+                linewidths=1,
+            )
+
+        # 1) Predicted points colored by alpha
+        ax = axes[0]
+        draw_trim(ax)
+        sc = ax.scatter(
+            vertices_np[:, 0],
+            vertices_np[:, 1],
+            c=alpha_np,
+            s=30,
+            cmap="viridis",
+            vmin=0,
+            vmax=1,
+        )
+        ax.scatter(seeds_np[:, 0], seeds_np[:, 1], c="red", s=50, label="Seeds")
+        ax.set_title("Predicted vertices colored by alpha")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal")
+        fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+
+        # 2) Exact Voronoi diagram
+        ax = axes[1]
+        draw_trim(ax)
+        voronoi_plot_2d(
+            vor,
+            ax=ax,
+            show_vertices=False,
+            show_points=False,
+            line_colors="black",
+            line_width=1,
+            line_alpha=0.7,
+            point_size=0,
+        )
+        ax.scatter(seeds_np[:, 0], seeds_np[:, 1], c="red", s=50, label="Seeds")
+        ax.scatter(
+            exact_inside_np[:, 0],
+            exact_inside_np[:, 1],
+            facecolors="none",
+            edgecolors="blue",
+            s=80,
+            label="Exact vertices",
+        )
+        ax.set_title("Exact SciPy Voronoi diagram")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal")
+
+        # 3) Thresholded predicted vs exact
+        ax = axes[2]
+        draw_trim(ax)
+        voronoi_plot_2d(
+            vor,
+            ax=ax,
+            show_vertices=False,
+            show_points=False,
+            line_colors="black",
+            line_width=1,
+            line_alpha=0.4,
+            point_size=0,
+        )
+        ax.scatter(seeds_np[:, 0], seeds_np[:, 1], c="red", s=50, label="Seeds")
+        ax.scatter(
+            exact_inside_np[:, 0],
+            exact_inside_np[:, 1],
+            facecolors="none",
+            edgecolors="blue",
+            s=90,
+            label="Exact vertices",
+        )
+        ax.scatter(
+            pred_np[:, 0],
+            pred_np[:, 1],
+            c="orange",
+            marker="x",
+            s=120,
+            label=f"Predicted alpha > {alpha_threshold}",
+        )
+        ax.set_title("Thresholded prediction on exact Voronoi")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_aspect("equal")
+        ax.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+        if len(pred_np) > 0 and len(exact_inside_np) > 0:
+            tree_exact = cKDTree(exact_inside_np)
+            pred_to_exact_dist, _ = tree_exact.query(pred_np)
+
+            tree_pred = cKDTree(pred_np)
+            exact_to_pred_dist, exact_to_pred_idx = tree_pred.query(exact_inside_np)
+
+            print("Predicted active vertices:", len(pred_np))
+            print("Exact inside vertices:", len(exact_inside_np))
+            print("Pred -> exact mean:", pred_to_exact_dist.mean())
+            print("Pred -> exact max :", pred_to_exact_dist.max())
+            print("Exact -> pred mean:", exact_to_pred_dist.mean())
+            print("Exact -> pred max :", exact_to_pred_dist.max())
+
+            missed = exact_to_pred_dist > miss_tol
+
+            if missed.any():
+                print("\nMissing exact vertices:")
+                print(f"miss_tol = {miss_tol}")
+
+                tree_all = cKDTree(vertices_np)
+
+                validity = out.get("validity", {})
+                diagnostics = out.get("diagnostics", {})
+
+                for exact_id in np.where(missed)[0]:
+                    exact_v = exact_inside_np[exact_id]
+
+                    d_all, cand_idx = tree_all.query(exact_v)
+
+                    print("\n--------------------------------")
+                    print(f"Exact vertex {exact_id}")
+                    print(f"exact uv        = ({exact_v[0]:.6f}, {exact_v[1]:.6f})")
+                    print(f"nearest pred d  = {exact_to_pred_dist[exact_id]:.6f}")
+                    print(f"nearest raw idx = {cand_idx}")
+                    print(f"nearest raw uv  = ({vertices_np[cand_idx,0]:.6f}, {vertices_np[cand_idx,1]:.6f})")
+                    print(f"raw distance    = {d_all:.6f}")
+                    print(f"raw alpha       = {alpha_np[cand_idx]:.6e}")
+
+                    if "triple_idx" in out:
+                        triple = out["triple_idx"][cand_idx].detach().cpu().numpy()
+                        print(f"triple_idx      = {triple.tolist()}")
+
+                    for name, value in validity.items():
+                        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] > cand_idx:
+                            print(f"gate {name:>12s} = {value[cand_idx].detach().cpu().item():.6e}")
+
+                    if "vertex_keff" in diagnostics:
+                        keff = diagnostics["vertex_keff"]
+                        if torch.is_tensor(keff) and keff.ndim > 0 and keff.shape[0] > cand_idx:
+                            print(f"vertex_keff     = {keff[cand_idx].detach().cpu().item():.6f}")
+
+                    if "alpha_base" in diagnostics:
+                        ab = diagnostics["alpha_base"]
+                        if torch.is_tensor(ab) and ab.ndim > 0 and ab.shape[0] > cand_idx:
+                            print(f"alpha_base      = {ab[cand_idx].detach().cpu().item():.6e}")
+
+                    if "vertex_competition_gate" in diagnostics:
+                        cg = diagnostics["vertex_competition_gate"]
+                        if torch.is_tensor(cg) and cg.ndim > 0 and cg.shape[0] > cand_idx:
+                            print(f"competition     = {cg[cand_idx].detach().cpu().item():.6e}")
+            else:
+                print(f"\nNo missing exact vertices with miss_tol={miss_tol}.")
+
+        else:
+            print("Cannot compare: one set is empty.")
+            print("Predicted active vertices:", len(pred_np))
+            print("Exact inside vertices:", len(exact_inside_np))
 
 __all__ = ["ContinuousVoronoiDecoder"]
