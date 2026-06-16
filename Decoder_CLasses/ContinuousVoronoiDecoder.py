@@ -45,6 +45,8 @@ class ContinuousVoronoiDecoder(nn.Module):
         seed_activity_threshold: float = 0.5,
         domain_effect_floor: float = 1e-8,
         hard_seed_mask: bool = False,
+        seed_boundary_margin: float = 0.02,
+        vertex_boundary_margin: float = 0.02,
     ):
         super().__init__()
         self.eps = float(eps)
@@ -70,6 +72,8 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.seed_activity_threshold = float(seed_activity_threshold)
         self.domain_effect_floor = float(domain_effect_floor)
         self.hard_seed_mask = bool(hard_seed_mask)
+        self.seed_boundary_margin = float(seed_boundary_margin)
+        self.vertex_boundary_margin = float(vertex_boundary_margin)
         if empty_circle_margin is None:
             empty_circle_margin = 0.5 * tau_voronoi
 
@@ -145,7 +149,10 @@ class ContinuousVoronoiDecoder(nn.Module):
         if hasattr(cad_domain, "sample_trim_sdf"):
             sdf = cad_domain.sample_trim_sdf(seeds_uv)
             sdf = torch.as_tensor(sdf, dtype=seeds_uv.dtype, device=seeds_uv.device)
-            domain_weight = torch.sigmoid(sdf / self._tau_tensor(self.tau_trim, seeds_uv))
+            domain_weight = torch.sigmoid(
+                (sdf + self.seed_boundary_margin)
+                / self._tau_tensor(self.tau_trim, seeds_uv)
+            )
         elif hasattr(cad_domain, "smooth_inside_activity"):
             domain_weight = cad_domain.smooth_inside_activity(seeds_uv, tau=self.tau_trim)
             domain_weight = torch.as_tensor(domain_weight, dtype=seeds_uv.dtype, device=seeds_uv.device)
@@ -352,8 +359,16 @@ class ContinuousVoronoiDecoder(nn.Module):
         if cad_domain is None or not self.use_trim_activity:
             return torch.ones(P_uv.shape[:-1], dtype=P_uv.dtype, device=P_uv.device)
 
+        if hasattr(cad_domain, "sample_trim_sdf"):
+            sdf = cad_domain.sample_trim_sdf(P_uv)
+            sdf = torch.as_tensor(sdf, dtype=P_uv.dtype, device=P_uv.device)
+            return torch.sigmoid(
+                (sdf + self.vertex_boundary_margin)
+                / self._tau_tensor(self.tau_trim, P_uv)
+            )
+
         g_trim = cad_domain.smooth_inside_activity(P_uv, tau=self.tau_trim)
-        return g_trim.to(dtype=P_uv.dtype, device=P_uv.device)
+        return torch.as_tensor(g_trim, dtype=P_uv.dtype, device=P_uv.device)
     def vertex_soft_competition_gate(
         self,
         P_uv: torch.Tensor,
@@ -477,6 +492,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         u_periodic: bool = False,
         v_periodic: bool = False,
         return_xyz: bool | None = None,
+        debug_compare_scipy: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(seeds_uv, torch.Tensor):
             raise TypeError("seeds_uv must be a torch.Tensor.")
@@ -540,11 +556,12 @@ class ContinuousVoronoiDecoder(nn.Module):
         g_area = self.area_gate(qi, qj, qk)
         g_box = self.box_gate(P_uv, u_periodic, v_periodic)
         g_trim = self.trim_gate(P_uv, cad_domain)
-        if cad_domain is None:
-            g_domain = g_box
-        else:
-            g_domain = g_trim
+        g_domain = g_trim if cad_domain is not None and self.use_trim_activity else g_box
         g_vor = self.empty_circle_gate(seeds_uv, P_uv, triples, u_periodic, v_periodic)
+
+        if debug_compare_scipy:
+            g_seed = torch.ones_like(g_vor)
+            g_domain = g_box
 
         if self.use_seed_weight_gate:
             g_keff, vertex_seed_weights, vertex_keff = self.seed_weight_vertex_gate(
@@ -571,18 +588,20 @@ class ContinuousVoronoiDecoder(nn.Module):
             * g_area
             * g_domain
             * g_vor
+            #* g_keff
         )
         if self.use_close_gate:
-            alpha = alpha * g_close
+            alpha_base = alpha_base * g_close
         g_compete = self.vertex_soft_competition_gate(
             P_uv,
             alpha_base,
-            sigma=0.01,
-            temperature=0.05,
-            floor=0.05,
+            sigma=0.005,
+            temperature=0.08,
+            floor=0.2,
         )
 
         alpha = alpha_base * g_compete
+        alpha = alpha_base
         
         alpha = torch.nan_to_num(alpha, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         P_uv = torch.nan_to_num(P_uv, nan=0.0, posinf=0.0, neginf=0.0)
@@ -596,6 +615,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             "area": g_area,
             "box": g_box,
             "trim": g_trim,
+            "domain": g_domain,
             "empty_circle": g_vor,
             "keff": g_keff,
         }
@@ -611,6 +631,8 @@ class ContinuousVoronoiDecoder(nn.Module):
             "num_triples": triples.shape[0],
             "u_periodic": bool(u_periodic),
             "v_periodic": bool(v_periodic),
+            "alpha_base": alpha_base,
+            "vertex_competition_gate": g_compete,
         }
         diagnostics.update({
             "seed_activity_weights": seed_state["weights"],
@@ -661,6 +683,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             "area": empty,
             "box": empty,
             "trim": empty,
+            "domain": empty,
             "empty_circle": empty,
             "keff": empty,
         }
@@ -790,7 +813,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             vmax=1,
         )
         ax.scatter(seeds_np[:, 0], seeds_np[:, 1], c="red", s=50, label="Seeds")
-        ax.set_title("Predicted vertices colored by alpha")
+        ax.set_title("Predicted vertices colored by Their Validity")
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.set_aspect("equal")
@@ -851,9 +874,9 @@ class ContinuousVoronoiDecoder(nn.Module):
             c="orange",
             marker="x",
             s=120,
-            label=f"Predicted alpha > {alpha_threshold}",
+            label=f"Predicted Validity > {alpha_threshold}",
         )
-        ax.set_title("Thresholded prediction on exact Voronoi")
+        ax.set_title("Thresholded Validity prediction on exact Voronoi")
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.set_aspect("equal")
