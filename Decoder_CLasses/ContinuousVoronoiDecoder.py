@@ -586,7 +586,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         alpha_base = (
             g_seed
             * g_area
-            * g_domain
+            #* g_domain
             * g_vor
             #* g_keff
         )
@@ -605,6 +605,12 @@ class ContinuousVoronoiDecoder(nn.Module):
         
         alpha = torch.nan_to_num(alpha, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         P_uv = torch.nan_to_num(P_uv, nan=0.0, posinf=0.0, neginf=0.0)
+
+        edge_data = self.build_soft_edges(
+    vertices_uv=P_uv,
+    alpha=alpha,
+    triples=triples,
+)
 
         topk = min(5, seeds_uv.shape[0])
         topk_weights, topk_seed_idx = torch.topk(vertex_seed_weights, k=topk, dim=1)
@@ -649,6 +655,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             "triple_idx": triples,
             "validity": validity,
             "diagnostics": diagnostics,
+            "edges" : edge_data,
         }
 
         if cad_domain is not None and want_xyz:
@@ -719,16 +726,74 @@ class ContinuousVoronoiDecoder(nn.Module):
             "seed_sdf": seed_state["seed_sdf"],
             "triple_seed_activity": empty,
         })
+
+        edge_data= {
+    "edge_index": torch.empty((0, 2), dtype=torch.long, device=seeds_uv.device),
+    "edge_alpha": empty,
+    "edge_seed_pair": torch.empty((0, 2), dtype=torch.long, device=seeds_uv.device),
+}
         out: dict[str, Any] = {
             "vertices_uv": vertices_uv,
             "alpha": empty,
             "triple_idx": triples,
             "validity": validity,
             "diagnostics": diagnostics,
+            "edges" :edge_data
         }
         if cad_domain is not None and want_xyz:
             out["vertices_xyz"] = torch.empty((0, 3), dtype=seeds_uv.dtype, device=seeds_uv.device)
         return out
+    
+    def build_soft_edges(
+    self,
+    vertices_uv: torch.Tensor,
+    alpha: torch.Tensor,
+    triples: torch.Tensor,
+    min_edge_alpha: float = 0.0,
+):
+        T = triples.shape[0]
+        if T < 2:
+            return {
+                "edge_index": torch.empty((0, 2), dtype=torch.long, device=vertices_uv.device),
+                "edge_alpha": torch.empty((0,), dtype=vertices_uv.dtype, device=vertices_uv.device),
+                "edge_seed_pair": torch.empty((0, 2), dtype=torch.long, device=vertices_uv.device),
+            }
+
+        edges = []
+        edge_seed_pairs = []
+
+        for a in range(T):
+            set_a = set(map(int, triples[a].detach().cpu().tolist()))
+            for b in range(a + 1, T):
+                set_b = set(map(int, triples[b].detach().cpu().tolist()))
+                shared = sorted(list(set_a.intersection(set_b)))
+                if len(shared) == 2:
+                    edges.append([a, b])
+                    edge_seed_pairs.append(shared)
+
+        if len(edges) == 0:
+            return {
+                "edge_index": torch.empty((0, 2), dtype=torch.long, device=vertices_uv.device),
+                "edge_alpha": torch.empty((0,), dtype=vertices_uv.dtype, device=vertices_uv.device),
+                "edge_seed_pair": torch.empty((0, 2), dtype=torch.long, device=vertices_uv.device),
+            }
+
+        edge_index = torch.tensor(edges, dtype=torch.long, device=vertices_uv.device)
+        edge_seed_pair = torch.tensor(edge_seed_pairs, dtype=torch.long, device=vertices_uv.device)
+
+        edge_alpha = alpha[edge_index[:, 0]] * alpha[edge_index[:, 1]]
+
+        if min_edge_alpha > 0:
+            keep = edge_alpha > min_edge_alpha
+            edge_index = edge_index[keep]
+            edge_alpha = edge_alpha[keep]
+            edge_seed_pair = edge_seed_pair[keep]
+
+        return {
+            "edge_index": edge_index,
+            "edge_alpha": edge_alpha,
+            "edge_seed_pair": edge_seed_pair,
+        }
     
     def plot_voronoi_debug(
     self,
@@ -953,5 +1018,3 @@ class ContinuousVoronoiDecoder(nn.Module):
             print("Cannot compare: one set is empty.")
             print("Predicted active vertices:", len(pred_np))
             print("Exact inside vertices:", len(exact_inside_np))
-
-__all__ = ["ContinuousVoronoiDecoder"]
