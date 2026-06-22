@@ -53,6 +53,7 @@ class CADTensorGenerator:
         self._active_v_raw_bounds = None
         self._seed_domain_mask_grid = None
         self._seed_domain_sdf_grid = None
+        self._boundary_parameter_loops = None
         self._u_periodic = False
         self._v_periodic = False
         self._u_period = None
@@ -310,6 +311,99 @@ class CADTensorGenerator:
 
         return sdf.astype(np.float32)
 
+    def _build_boundary_parameter_loops(self) -> list[np.ndarray]:
+        """Extract ordered normalized-UV trim loops from the cached SDF grid."""
+        if self._seed_domain_sdf_grid is None:
+            raise RuntimeError("Call generate_from_file(shape_path) before extracting trim loops.")
+
+        # Matplotlib's contour engine gives ordered polylines and correctly
+        # separates the outer trim wire from any inner-hole wires.
+        from matplotlib.figure import Figure
+
+        sdf = self._seed_domain_sdf_grid.detach().cpu().numpy()
+        height, width = sdf.shape
+        u = np.linspace(0.0, 1.0, width)
+        v = np.linspace(0.0, 1.0, height)
+        figure = Figure()
+        axis = figure.subplots()
+        contour = axis.contour(u, v, sdf, levels=[0.0])
+        loops = [
+            np.asarray(segment, dtype=np.float64)
+            for segment in contour.allsegs[0]
+            if np.asarray(segment).shape[0] >= 2
+        ]
+        figure.clear()
+
+        if not loops:
+            raise RuntimeError(
+                "No trim-boundary loops could be extracted from the CAD SDF grid."
+            )
+        self._boundary_parameter_loops = loops
+        return loops
+
+    def boundary_parameter(self, uv_norm):
+        """Return nearest trim-loop id and cyclic arclength for UV boundary points.
+
+        This is a topology/debugging operation: loop assignment is intentionally
+        detached while the graph's node coordinates remain differentiable.
+        """
+        self._require_active_face()
+        device = uv_norm.device if isinstance(uv_norm, torch.Tensor) else self.device
+        dtype = uv_norm.dtype if isinstance(uv_norm, torch.Tensor) else torch.float32
+        points = (
+            uv_norm.detach().cpu().numpy()
+            if isinstance(uv_norm, torch.Tensor)
+            else np.asarray(uv_norm, dtype=np.float64)
+        )
+        original_shape = points.shape[:-1]
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        loops = self._boundary_parameter_loops
+        if loops is None:
+            loops = self._build_boundary_parameter_loops()
+
+        loop_ids = np.full((points.shape[0],), -1, dtype=np.int64)
+        parameters = np.zeros((points.shape[0],), dtype=np.float64)
+        best_distance2 = np.full((points.shape[0],), np.inf, dtype=np.float64)
+
+        for loop_id, loop in enumerate(loops):
+            if np.linalg.norm(loop[0] - loop[-1]) > 1e-10:
+                loop = np.concatenate((loop, loop[:1]), axis=0)
+            starts = loop[:-1]
+            deltas = loop[1:] - starts
+            lengths = np.linalg.norm(deltas, axis=1)
+            valid = lengths > 1e-12
+            starts = starts[valid]
+            deltas = deltas[valid]
+            lengths = lengths[valid]
+            if lengths.size == 0:
+                continue
+            cumulative = np.concatenate(([0.0], np.cumsum(lengths[:-1])))
+
+            rel = points[:, None, :] - starts[None, :, :]
+            fraction = np.sum(rel * deltas[None, :, :], axis=-1) / (
+                lengths[None, :] ** 2
+            )
+            fraction = np.clip(fraction, 0.0, 1.0)
+            projected = starts[None, :, :] + fraction[..., None] * deltas[None, :, :]
+            distance2 = np.sum((points[:, None, :] - projected) ** 2, axis=-1)
+            segment_id = np.argmin(distance2, axis=1)
+            row = np.arange(points.shape[0])
+            nearest_distance2 = distance2[row, segment_id]
+            better = nearest_distance2 < best_distance2
+            loop_ids[better] = loop_id
+            parameters[better] = (
+                cumulative[segment_id[better]]
+                + fraction[row[better], segment_id[better]] * lengths[segment_id[better]]
+            )
+            best_distance2[better] = nearest_distance2[better]
+
+        if np.any(loop_ids < 0):
+            raise RuntimeError("Could not assign all UV points to a CAD trim loop.")
+        return {
+            "loop_id": torch.as_tensor(loop_ids.reshape(original_shape), dtype=torch.long, device=device),
+            "parameter": torch.as_tensor(parameters.reshape(original_shape), dtype=dtype, device=device),
+        }
+
     def uv_norm_inside_mask(self, uv_norm, tol: float | None = None):
         """
         Debug/final-filter hard trim mask. Optimization should prefer the SDF.
@@ -517,6 +611,7 @@ class CADTensorGenerator:
             dtype=torch.float32,
             device=self.device,
         )
+        self._boundary_parameter_loops = None
 
         return {
             "u_raw_bounds": self._active_u_raw_bounds,
