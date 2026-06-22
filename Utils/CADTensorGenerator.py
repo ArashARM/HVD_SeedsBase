@@ -24,6 +24,81 @@ try:
 except Exception:
     distance_transform_edt = None
 
+try:
+    import gmsh
+except Exception:
+    gmsh = None
+
+
+class _OCCSurfaceEvaluation(torch.autograd.Function):
+    """Torch autograd bridge for a fixed OpenCascade parametric surface.
+
+    OpenCascade chooses/evaluates the CAD representation outside Torch. Its
+    exact first surface derivatives provide the local Jacobian used in the
+    backward pass, so gradients flow from XYZ back to normalized UV.
+    """
+
+    @staticmethod
+    def forward(ctx, uv_norm: torch.Tensor, cad_domain):
+        cad_domain._require_active_face()
+        if uv_norm.ndim != 2 or uv_norm.shape[-1] != 2:
+            raise ValueError("uv_norm must have shape [N, 2].")
+        if not uv_norm.is_floating_point():
+            raise TypeError("uv_norm must be a floating point tensor.")
+
+        uv_raw = cad_domain.uv_norm_to_raw_from_bounds(
+            uv_norm.detach().cpu().numpy(),
+            u_raw_bounds=cad_domain._active_u_raw_bounds,
+            v_raw_bounds=cad_domain._active_v_raw_bounds,
+        )
+        xyz = np.empty((uv_raw.shape[0], 3), dtype=np.float64)
+        xu_norm = np.empty_like(xyz)
+        xv_norm = np.empty_like(xyz)
+        u_scale = (
+            cad_domain._active_u_raw_bounds[1]
+            - cad_domain._active_u_raw_bounds[0]
+        )
+        v_scale = (
+            cad_domain._active_v_raw_bounds[1]
+            - cad_domain._active_v_raw_bounds[0]
+        )
+
+        for index, (u, v) in enumerate(uv_raw):
+            props = GeomLProp_SLProps(
+                cad_domain._active_surface,
+                float(u),
+                float(v),
+                1,
+                cad_domain.metric_tol,
+            )
+            point = props.Value()
+            du = props.D1U()
+            dv = props.D1V()
+            xyz[index] = (point.X(), point.Y(), point.Z())
+            xu_norm[index] = (
+                du.X() * u_scale,
+                du.Y() * u_scale,
+                du.Z() * u_scale,
+            )
+            xv_norm[index] = (
+                dv.X() * v_scale,
+                dv.Y() * v_scale,
+                dv.Z() * v_scale,
+            )
+
+        xyz_t = torch.as_tensor(xyz, dtype=uv_norm.dtype, device=uv_norm.device)
+        xu_t = torch.as_tensor(xu_norm, dtype=uv_norm.dtype, device=uv_norm.device)
+        xv_t = torch.as_tensor(xv_norm, dtype=uv_norm.dtype, device=uv_norm.device)
+        ctx.save_for_backward(xu_t, xv_t)
+        return xyz_t
+
+    @staticmethod
+    def backward(ctx, grad_xyz: torch.Tensor):
+        xu_norm, xv_norm = ctx.saved_tensors
+        grad_u = (grad_xyz * xu_norm).sum(dim=-1)
+        grad_v = (grad_xyz * xv_norm).sum(dim=-1)
+        return torch.stack((grad_u, grad_v), dim=-1), None
+
 
 class CADTensorGenerator:
     """
@@ -58,6 +133,9 @@ class CADTensorGenerator:
         self._v_periodic = False
         self._u_period = None
         self._v_period = None
+        self._active_shape_path = None
+        self._shell_tensors_cache = None
+        self._shell_mesh_cache_key = None
 
     # =========================================================================
     # 1) CAD loading + single-face helpers
@@ -553,6 +631,209 @@ class CADTensorGenerator:
     def eval_uv_norm_batch(self, uv_norm, *args, **kwargs):
         return self.eval_uv_norm(uv_norm, *args, **kwargs)
 
+    def eval_uv_norm_batch_torch(
+        self,
+        uv_norm: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Differentiably map normalized UV points to XYZ on the active face.
+
+        The CAD surface is fixed and its topology is outside autograd. XYZ
+        gradients propagate to UV through OpenCascade's exact first surface
+        derivatives. This supports first-order gradient-based optimization;
+        higher-order UV derivatives are not provided by this bridge.
+        """
+        if not isinstance(uv_norm, torch.Tensor):
+            raise TypeError("uv_norm must be a torch.Tensor.")
+        original_shape = uv_norm.shape[:-1]
+        flat_uv = uv_norm.reshape(-1, 2)
+        xyz = _OCCSurfaceEvaluation.apply(flat_uv, self)
+        return {
+            "uv_norm": uv_norm,
+            "xyz": xyz.reshape(*original_shape, 3),
+        }
+
+    def sample_shell_tensors(
+        self,
+        res: int = 96,
+        mesh_size: float | None = None,
+        force_remesh: bool = False,
+    ) -> dict:
+        """Create and cache one Gmsh surface mesh for ``ThickenShell``.
+
+        The first call meshes the active STEP/IGES face. Subsequent calls with
+        the same resolution/mesh size return the exact cached tensor objects,
+        so an optimization loop can reuse them without invoking Gmsh again.
+        ``res`` only supplies a default physical mesh size; pass ``mesh_size``
+        to control it directly in CAD units.
+        """
+        self._require_active_face()
+        if gmsh is None:
+            raise ImportError(
+                "Gmsh is required for sample_shell_tensors(); install the Python "
+                "package 'gmsh' in the notebook environment."
+            )
+        if self._active_shape_path is None:
+            raise RuntimeError("The active CAD file path is unavailable; reload it first.")
+
+        res = int(res)
+        if res < 3:
+            raise ValueError(f"res must be at least 3, got {res}")
+
+        box = Bnd_Box()
+        brepbndlib.Add(self._active_face, box)
+        xmin, ymin, zmin, xmax, ymax, zmax = map(float, box.Get())
+        diagonal = float(np.linalg.norm([xmax - xmin, ymax - ymin, zmax - zmin]))
+        target_size = (
+            float(mesh_size)
+            if mesh_size is not None
+            else diagonal / float(max(res - 1, 1))
+        )
+        if target_size <= 0.0:
+            raise ValueError(f"mesh_size must be positive, got {target_size}")
+
+        cache_key = (os.path.abspath(self._active_shape_path), target_size)
+        if (
+            not force_remesh
+            and self._shell_tensors_cache is not None
+            and self._shell_mesh_cache_key == cache_key
+        ):
+            return self._shell_tensors_cache
+
+        owns_gmsh = not bool(gmsh.isInitialized())
+        if owns_gmsh:
+            gmsh.initialize()
+        try:
+            gmsh.clear()
+            gmsh.model.add("cad_tensor_surface")
+            gmsh.model.occ.importShapes(os.fspath(self._active_shape_path))
+            gmsh.model.occ.synchronize()
+
+            surfaces = gmsh.model.getEntities(2)
+            if len(surfaces) != 1:
+                raise ValueError(
+                    f"Expected Gmsh to import one CAD face, got {len(surfaces)}."
+                )
+            surface_tag = int(surfaces[0][1])
+            gmsh.option.setNumber("Mesh.MeshSizeMin", target_size)
+            gmsh.option.setNumber("Mesh.MeshSizeMax", target_size)
+            gmsh.option.setNumber("Mesh.ElementOrder", 1)
+            gmsh.model.mesh.generate(2)
+
+            node_tags, _coords, uv_raw_flat = gmsh.model.mesh.getNodes(
+                2,
+                surface_tag,
+                includeBoundary=True,
+                returnParametricCoord=True,
+            )
+            node_tags = np.asarray(node_tags, dtype=np.int64)
+            uv_raw_np = np.asarray(uv_raw_flat, dtype=float).reshape(-1, 2)
+            if node_tags.size == 0 or uv_raw_np.shape[0] != node_tags.size:
+                raise RuntimeError("Gmsh did not return surface UV coordinates.")
+
+            # A node can be returned more than once when boundary entities are
+            # included. Keep one UV record per Gmsh node tag.
+            unique_tags, first = np.unique(node_tags, return_index=True)
+            order = np.argsort(first)
+            node_tags = unique_tags[order]
+            uv_raw_np = uv_raw_np[first[order]]
+            tag_to_index = {int(tag): i for i, tag in enumerate(node_tags)}
+
+            triangles = []
+            element_types, _element_tags, element_nodes = gmsh.model.mesh.getElements(
+                2, surface_tag
+            )
+            for element_type, connectivity in zip(element_types, element_nodes):
+                _name, dim, _order, num_nodes, _local, num_primary = (
+                    gmsh.model.mesh.getElementProperties(int(element_type))
+                )
+                if int(dim) != 2:
+                    continue
+                conn = np.asarray(connectivity, dtype=np.int64).reshape(-1, int(num_nodes))
+                primary = conn[:, :int(num_primary)]
+                if primary.shape[1] == 3:
+                    triangles.extend(primary.tolist())
+                elif primary.shape[1] == 4:
+                    triangles.extend(primary[:, [0, 1, 2]].tolist())
+                    triangles.extend(primary[:, [0, 2, 3]].tolist())
+
+            if not triangles:
+                raise RuntimeError("Gmsh generated no surface triangles.")
+            faces_np = np.asarray(
+                [[tag_to_index[int(tag)] for tag in tri] for tri in triangles],
+                dtype=np.int64,
+            )
+
+            boundary_tags = []
+            for dim, curve_tag in gmsh.model.getBoundary(
+                [(2, surface_tag)], oriented=False, recursive=False
+            ):
+                tags, _xyz, _param = gmsh.model.mesh.getNodes(
+                    int(dim), int(curve_tag), includeBoundary=True
+                )
+                boundary_tags.extend(np.asarray(tags, dtype=np.int64).tolist())
+            boundary_idx = np.asarray(
+                sorted({tag_to_index[int(tag)] for tag in boundary_tags if int(tag) in tag_to_index}),
+                dtype=np.int64,
+            )
+        finally:
+            gmsh.clear()
+            if owns_gmsh:
+                gmsh.finalize()
+
+        uv_norm_np = self.uv_raw_to_norm_from_bounds(
+            uv_raw_np,
+            u_raw_bounds=self._active_u_raw_bounds,
+            v_raw_bounds=self._active_v_raw_bounds,
+        )
+        evaluated = self.eval_uv_norm(uv_norm_np, return_inside_mask=False)
+        points = evaluated["xyz"]
+        xu = evaluated["Xu"]
+        xv = evaluated["Xv"]
+        uv = evaluated["uv_norm"]
+
+        if faces_np.shape[0] > 0:
+            points_np = points.detach().cpu().numpy()
+            p0 = points_np[faces_np[:, 0]]
+            p1 = points_np[faces_np[:, 1]]
+            p2 = points_np[faces_np[:, 2]]
+            face_areas_np = 0.5 * np.linalg.norm(
+                np.cross(p1 - p0, p2 - p0), axis=1
+            )
+
+        else:
+            face_areas_np = np.empty((0,), dtype=np.float32)
+
+        bbox = {
+            "xmin": xmin, "xmax": xmax,
+            "ymin": ymin, "ymax": ymax,
+            "zmin": zmin, "zmax": zmax,
+        }
+
+        faces_t = torch.as_tensor(faces_np, dtype=torch.long, device=self.device)
+        if faces_np.shape[0] > 0:
+            pv_faces_np = np.column_stack(
+                (np.full(faces_np.shape[0], 3, dtype=np.int64), faces_np)
+            ).reshape(-1)
+        else:
+            pv_faces_np = np.empty((0,), dtype=np.int64)
+
+        shell_tensors = {
+            "uv": uv,
+            "points_xyz": points,
+            "face_areas": torch.as_tensor(face_areas_np, dtype=points.dtype, device=self.device),
+            "Xu": xu,
+            "Xv": xv,
+            "faces_ijk": faces_t,
+            "pv_faces": torch.as_tensor(pv_faces_np, dtype=torch.long, device=self.device),
+            "face_id": torch.zeros(points.shape[0], dtype=torch.long, device=self.device),
+            "boundary_idx_ring1": torch.as_tensor(boundary_idx, dtype=torch.long, device=self.device),
+            "min_vol_frac": torch.tensor(0.0, dtype=points.dtype, device=self.device),
+            "BBX": bbox,
+        }
+        self._shell_tensors_cache = shell_tensors
+        self._shell_mesh_cache_key = cache_key
+        return shell_tensors
+
     # =========================================================================
     # 5) Decoder contract
     # =========================================================================
@@ -597,6 +878,7 @@ class CADTensorGenerator:
         sdf_grid_np = self.build_seed_domain_sdf_grid(mask_grid_np)
 
         self._active_shape = shape
+        self._active_shape_path = os.path.abspath(os.fspath(shape_path))
         self._active_face = face
         self._active_surface = surf
         self._active_u_raw_bounds = (float(umin), float(umax))
@@ -612,6 +894,8 @@ class CADTensorGenerator:
             device=self.device,
         )
         self._boundary_parameter_loops = None
+        self._shell_tensors_cache = None
+        self._shell_mesh_cache_key = None
 
         return {
             "u_raw_bounds": self._active_u_raw_bounds,

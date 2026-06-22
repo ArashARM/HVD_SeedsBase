@@ -122,6 +122,610 @@ class ContinuousVoronoiDecoder(nn.Module):
         diff = self.periodic_difference(a, b, u_periodic, v_periodic)
         return torch.sqrt((diff * diff).sum(dim=-1) + self.eps)
 
+    def unwrap_edge_uv(
+        self,
+        p0: torch.Tensor,
+        p1: torch.Tensor,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return an edge endpoint pair on the nearest periodic UV image."""
+        p1_unwrapped = p0 + self.periodic_difference(
+            p1, p0, u_periodic=u_periodic, v_periodic=v_periodic
+        )
+        return p0, p1_unwrapped
+
+    def sample_boundary_box_edge_uv(
+        self,
+        p0: torch.Tensor,
+        p1: torch.Tensor,
+        n_samples: int,
+    ) -> torch.Tensor:
+        """Sample a UV-box boundary path between two boundary points."""
+        if p0.shape != (2,) or p1.shape != (2,):
+            raise ValueError("p0 and p1 must each have shape [2].")
+        if p0.device != p1.device or p0.dtype != p1.dtype:
+            raise ValueError("p0 and p1 must share dtype and device.")
+        if n_samples < 2:
+            raise ValueError("n_samples must be at least 2.")
+
+        tol = 1e-5
+        zero = p0.new_tensor(0.0)
+        one = p0.new_tensor(1.0)
+        s = torch.linspace(
+            0.0, 1.0, n_samples, dtype=p0.dtype, device=p0.device
+        )
+
+        same_left = bool((torch.abs(p0[0]) <= tol) & (torch.abs(p1[0]) <= tol))
+        same_right = bool((torch.abs(p0[0] - 1.0) <= tol) & (torch.abs(p1[0] - 1.0) <= tol))
+        same_bottom = bool((torch.abs(p0[1]) <= tol) & (torch.abs(p1[1]) <= tol))
+        same_top = bool((torch.abs(p0[1] - 1.0) <= tol) & (torch.abs(p1[1] - 1.0) <= tol))
+
+        if same_left:
+            curve = torch.stack((torch.zeros_like(s), p0[1] + s * (p1[1] - p0[1])), dim=-1)
+        elif same_right:
+            curve = torch.stack((torch.ones_like(s), p0[1] + s * (p1[1] - p0[1])), dim=-1)
+        elif same_bottom:
+            curve = torch.stack((p0[0] + s * (p1[0] - p0[0]), torch.zeros_like(s)), dim=-1)
+        elif same_top:
+            curve = torch.stack((p0[0] + s * (p1[0] - p0[0]), torch.ones_like(s)), dim=-1)
+        else:
+            if n_samples == 2:
+                return torch.stack((p0, p1)).clamp(0.0, 1.0)
+            corners = torch.stack((
+                torch.stack((zero, zero)),
+                torch.stack((one, zero)),
+                torch.stack((one, one)),
+                torch.stack((zero, one)),
+            ))
+            corner_distance = (
+                torch.linalg.vector_norm(corners - p0, dim=-1)
+                + torch.linalg.vector_norm(corners - p1, dim=-1)
+            )
+            # Shell topology determines which sides are connected. The nearest
+            # shared corner is a discrete routing choice; segment geometry is
+            # still differentiable with respect to both endpoints.
+            corner = corners[torch.argmin(corner_distance)]
+            first_count = n_samples // 2 + 1
+            second_count = n_samples - first_count + 1
+            first_s = torch.linspace(
+                0.0, 1.0, first_count, dtype=p0.dtype, device=p0.device
+            )[:, None]
+            second_s = torch.linspace(
+                0.0, 1.0, second_count, dtype=p0.dtype, device=p0.device
+            )[:, None]
+            first = p0 + first_s * (corner - p0)
+            second = corner + second_s * (p1 - corner)
+            curve = torch.cat((first[:-1], second), dim=0)
+
+        return curve.clamp(0.0, 1.0)
+
+    def sample_smooth_edge_curves_uv(
+        self,
+        seeds_uv: torch.Tensor,
+        vertices_uv: torch.Tensor,
+        edges: torch.Tensor,
+        edge_seed_pairs: torch.Tensor,
+        n_samples: int = 64,
+        tangent_scale: float = 0.5,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+    ) -> torch.Tensor:
+        """Sample differentiable cubic Hermite curves on fixed graph edges.
+
+        Edge connectivity (possibly supplied by SciPy) is discrete and is not
+        differentiable.  Once that connectivity is fixed, the endpoint and
+        tangent calculations below remain differentiable with respect to the
+        seed and vertex geometry.
+        """
+        if seeds_uv.ndim != 2 or seeds_uv.shape[-1] != 2:
+            raise ValueError("seeds_uv must have shape [S, 2].")
+        if vertices_uv.ndim != 2 or vertices_uv.shape[-1] != 2:
+            raise ValueError("vertices_uv must have shape [V, 2].")
+        if edges.ndim != 2 or edges.shape[-1] != 2:
+            raise ValueError("edges must have shape [E, 2].")
+        if edge_seed_pairs.shape != edges.shape:
+            raise ValueError("edge_seed_pairs must have shape [E, 2].")
+        if n_samples < 2:
+            raise ValueError("n_samples must be at least 2.")
+        if edges.device != vertices_uv.device or edge_seed_pairs.device != seeds_uv.device:
+            raise ValueError("seeds, vertices, edges, and seed pairs must share a device.")
+
+        num_edges = edges.shape[0]
+        if num_edges == 0:
+            return vertices_uv.new_empty((0, n_samples, 2))
+
+        p0 = vertices_uv[edges[:, 0]]
+        p1 = vertices_uv[edges[:, 1]]
+        p0, p1 = self.unwrap_edge_uv(
+            p0, p1, u_periodic=u_periodic, v_periodic=v_periodic
+        )
+        chord = p1 - p0
+        length = torch.linalg.vector_norm(chord, dim=-1, keepdim=True)
+        straight_tangent = F.normalize(chord, dim=-1, eps=self.eps)
+
+        seed_i = edge_seed_pairs[:, 0]
+        seed_j = edge_seed_pairs[:, 1]
+        valid_pair = (
+            (seed_i >= 0)
+            & (seed_j >= 0)
+            & (seed_i < seeds_uv.shape[0])
+            & (seed_j < seeds_uv.shape[0])
+            & (seed_i != seed_j)
+        )
+
+        if seeds_uv.shape[0] == 0:
+            tangent = straight_tangent
+        else:
+            # Clamp only makes gathering safe for invalid pairs. torch.where
+            # replaces their values with a straight chord tangent.
+            safe_i = seed_i.clamp(0, seeds_uv.shape[0] - 1)
+            safe_j = seed_j.clamp(0, seeds_uv.shape[0] - 1)
+            seed_delta = self.periodic_difference(
+                seeds_uv[safe_j],
+                seeds_uv[safe_i],
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+            )
+            pair_tangent = F.normalize(
+                torch.stack((-seed_delta[:, 1], seed_delta[:, 0]), dim=-1),
+                dim=-1,
+                eps=self.eps,
+            )
+            orientation = torch.where(
+                (pair_tangent * chord).sum(dim=-1, keepdim=True) < 0,
+                -torch.ones_like(length),
+                torch.ones_like(length),
+            )
+            pair_tangent = pair_tangent * orientation
+            tangent = torch.where(valid_pair[:, None], pair_tangent, straight_tangent)
+
+        endpoint_tangent = tangent * length * tangent_scale
+        s = torch.linspace(
+            0.0, 1.0, n_samples, dtype=vertices_uv.dtype, device=vertices_uv.device
+        ).view(1, n_samples, 1)
+        s2 = s * s
+        s3 = s2 * s
+        h00 = 2.0 * s3 - 3.0 * s2 + 1.0
+        h10 = s3 - 2.0 * s2 + s
+        h01 = -2.0 * s3 + 3.0 * s2
+        h11 = s3 - s2
+        curve = (
+            h00 * p0[:, None, :]
+            + h10 * endpoint_tangent[:, None, :]
+            + h01 * p1[:, None, :]
+            + h11 * endpoint_tangent[:, None, :]
+        )
+        return self.wrap_uv(curve, u_periodic=u_periodic, v_periodic=v_periodic)
+
+    def sample_graph_edge_curves_uv(
+        self,
+        seeds_uv: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        n_samples: int = 64,
+        tangent_scale: float = 0.5,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+    ) -> torch.Tensor:
+        """Sample graph edges according to their discrete edge-type semantics.
+
+        edge_type meanings:
+            0 = interior Voronoi edge
+            1 = interior-to-boundary clipped Voronoi edge
+            2 = reserved
+            3 = boundary-to-boundary clipped Voronoi edge
+            4 = boundary shell / UV box loop edge
+
+        Only type 4 follows the UV-box boundary. Types 0, 1, and 3 remain
+        differentiable Voronoi-bisector Hermite curves.
+        """
+        nodes_uv = graph["nodes_uv"]
+        edge_index = graph["edge_index"]
+        edge_seed_pair = graph["edge_seed_pair"]
+        edge_type = graph.get("edge_type")
+        if edge_type is None:
+            edge_type = torch.zeros(
+                edge_index.shape[0], dtype=torch.long, device=nodes_uv.device
+            )
+        if edge_type.ndim != 1 or edge_type.shape[0] != edge_index.shape[0]:
+            raise ValueError("graph['edge_type'] must have shape [E].")
+
+        curves = self.sample_smooth_edge_curves_uv(
+            seeds_uv=seeds_uv,
+            vertices_uv=nodes_uv,
+            edges=edge_index,
+            edge_seed_pairs=edge_seed_pair,
+            n_samples=n_samples,
+            tangent_scale=tangent_scale,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
+        shell_ids = torch.nonzero(edge_type == 4, as_tuple=False).flatten()
+        if shell_ids.numel() == 0:
+            return curves
+
+        shell_curves = []
+        for edge_id in shell_ids:
+            a, b = edge_index[edge_id]
+            shell_curves.append(
+                self.sample_boundary_box_edge_uv(
+                    nodes_uv[a], nodes_uv[b], n_samples=n_samples
+                )
+            )
+        shell_curves_t = torch.stack(shell_curves)
+        result = curves.clone()
+        result[shell_ids] = shell_curves_t
+        return result
+
+    def sample_smooth_edge_curves_xyz(
+        self,
+        cad_domain: Any,
+        curves_uv: torch.Tensor,
+    ) -> torch.Tensor:
+        """Lift UV curves through a differentiable Torch UV-to-XYZ evaluator."""
+        evaluator = getattr(cad_domain, "eval_uv_norm_batch_torch", None)
+        if evaluator is None or not callable(evaluator):
+            raise TypeError(
+                "cad_domain must provide differentiable "
+                "eval_uv_norm_batch_torch(flat_uv) to sample edge curves in XYZ."
+            )
+        if curves_uv.ndim != 3 or curves_uv.shape[-1] != 2:
+            raise ValueError("curves_uv must have shape [E, n_samples, 2].")
+
+        flat_uv = curves_uv.reshape(-1, 2)
+        evaluated = evaluator(flat_uv)
+        xyz = evaluated["xyz"] if isinstance(evaluated, dict) else evaluated
+        if not isinstance(xyz, torch.Tensor):
+            raise TypeError("eval_uv_norm_batch_torch must return a torch.Tensor or {'xyz': tensor}.")
+        if xyz.ndim != 2 or xyz.shape != (flat_uv.shape[0], 3):
+            raise ValueError("Torch CAD evaluator must return XYZ with shape [E*n_samples, 3].")
+
+        # A smooth cubic UV curve becomes a smooth surface curve while this
+        # UV-to-XYZ mapping remains differentiable.
+        return xyz.reshape(curves_uv.shape[0], curves_uv.shape[1], 3)
+
+    def softmin_distance_to_curves(
+        self,
+        query_xyz: torch.Tensor,
+        curves_xyz: torch.Tensor,
+        tau: float = 0.01,
+    ) -> torch.Tensor:
+        """Return each query point's soft-min distance to all curve samples."""
+        if query_xyz.ndim != 2 or query_xyz.shape[-1] != 3:
+            raise ValueError("query_xyz must have shape [M, 3].")
+        if curves_xyz.ndim != 3 or curves_xyz.shape[-1] != 3:
+            raise ValueError("curves_xyz must have shape [E, K, 3].")
+        if query_xyz.device != curves_xyz.device:
+            raise ValueError("query_xyz and curves_xyz must share a device.")
+        if query_xyz.dtype != curves_xyz.dtype:
+            raise ValueError("query_xyz and curves_xyz must share a dtype.")
+        if not query_xyz.is_floating_point() or not curves_xyz.is_floating_point():
+            raise TypeError("query_xyz and curves_xyz must be floating point tensors.")
+        if tau <= 0.0:
+            raise ValueError("tau must be greater than zero.")
+
+        curve_points = curves_xyz.reshape(-1, 3)
+        if curve_points.shape[0] == 0:
+            raise ValueError("curves_xyz must contain at least one curve sample.")
+        distances = torch.cdist(query_xyz, curve_points)
+        tau_t = query_xyz.new_tensor(float(tau))
+        return -tau_t * torch.logsumexp(-distances / tau_t, dim=1)
+
+    def soft_tube_occupancy(
+        self,
+        query_xyz: torch.Tensor,
+        curves_xyz: torch.Tensor,
+        radius: torch.Tensor | float,
+        tau_distance: float = 0.01,
+        tau_occupancy: float = 0.01,
+    ) -> dict[str, torch.Tensor]:
+        """Build a differentiable swept-sphere occupancy field around curves.
+
+        ``radius`` is the physical positive radius. For a learnable
+        unconstrained parameter, apply ``F.softplus`` before calling this
+        method (as done with :meth:`make_learnable_radius`).
+        """
+        if tau_occupancy <= 0.0:
+            raise ValueError("tau_occupancy must be greater than zero.")
+        radius_tensor = torch.as_tensor(
+            radius, dtype=query_xyz.dtype, device=query_xyz.device
+        ).clamp_min(self.eps)
+        d_soft = self.softmin_distance_to_curves(
+            query_xyz=query_xyz,
+            curves_xyz=curves_xyz,
+            tau=tau_distance,
+        )
+        tau_occupancy_t = query_xyz.new_tensor(float(tau_occupancy))
+        occupancy = torch.sigmoid(
+            (radius_tensor - d_soft) / tau_occupancy_t
+        )
+        return {
+            "distance": d_soft,
+            "occupancy": occupancy,
+            "radius": radius_tensor,
+        }
+
+    def make_learnable_radius(
+        self,
+        initial_radius: float = 0.02,
+    ) -> nn.Parameter:
+        """Return a parameter whose softplus is ``initial_radius``."""
+        if initial_radius <= 0.0:
+            raise ValueError("initial_radius must be greater than zero.")
+        initial = torch.tensor(float(initial_radius), dtype=torch.get_default_dtype())
+        unconstrained = torch.log(torch.expm1(initial))
+        return nn.Parameter(unconstrained)
+
+    def graph_tube_field_xyz(
+        self,
+        seeds_uv: torch.Tensor,
+        cad_domain: Any,
+        query_xyz: torch.Tensor,
+        radius: torch.Tensor | float,
+        topology_mode: str = "scipy",
+        n_samples: int = 128,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+        tau_distance: float = 0.01,
+        tau_occupancy: float = 0.01,
+    ) -> dict[str, Any]:
+        """Map seeds to a differentiable XYZ swept-tube field.
+
+        Curve geometry and radius are differentiable while topology is fixed.
+        SciPy connectivity, pruning, edge types, and box/corner routing remain
+        discrete, matching MeshSDF-style local differentiability.
+        """
+        out = self(
+            seeds_uv,
+            topology_mode=topology_mode,
+            cad_domain=cad_domain,
+            return_xyz=True,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
+        graph = out["graph"]
+        curves_uv = self.sample_graph_edge_curves_uv(
+            seeds_uv=seeds_uv,
+            graph=graph,
+            n_samples=n_samples,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
+        curves_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv)
+        tube = self.soft_tube_occupancy(
+            query_xyz=query_xyz,
+            curves_xyz=curves_xyz,
+            radius=radius,
+            tau_distance=tau_distance,
+            tau_occupancy=tau_occupancy,
+        )
+        return {
+            "occupancy": tube["occupancy"],
+            "distance": tube["distance"],
+            "radius": tube["radius"],
+            "curves_uv": curves_uv,
+            "curves_xyz": curves_xyz,
+            "graph": graph,
+            "decoder_out": out,
+        }
+
+    def curve_points_and_tangents_xyz(
+        self,
+        curves_xyz: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flatten curve samples and their normalized finite-difference tangents."""
+        if curves_xyz.ndim != 3 or curves_xyz.shape[-1] != 3:
+            raise ValueError("curves_xyz must have shape [E, K, 3].")
+        if not curves_xyz.is_floating_point():
+            raise TypeError("curves_xyz must be a floating point tensor.")
+        if curves_xyz.shape[0] == 0:
+            raise ValueError("curves_xyz must contain at least one edge.")
+        if curves_xyz.shape[1] < 2:
+            raise ValueError("Each curve must contain at least two samples.")
+
+        first = curves_xyz[:, 1] - curves_xyz[:, 0]
+        middle = curves_xyz[:, 2:] - curves_xyz[:, :-2]
+        last = curves_xyz[:, -1] - curves_xyz[:, -2]
+        tangents = torch.cat(
+            (first[:, None, :], middle, last[:, None, :]), dim=1
+        )
+        tangents = tangents / torch.linalg.vector_norm(
+            tangents, dim=-1, keepdim=True
+        ).clamp_min(self.eps)
+        return curves_xyz.reshape(-1, 3), tangents.reshape(-1, 3)
+
+    def soft_tube_density_and_fiber_to_elements(
+        self,
+        elem_centers_xyz: torch.Tensor,
+        curves_xyz: torch.Tensor,
+        radius: torch.Tensor | float,
+        tau_distance: float = 0.01,
+        tau_density: float = 0.01,
+        tau_fiber: float = 0.01,
+        rho_min: float = 1e-3,
+    ) -> dict[str, torch.Tensor]:
+        """Map swept graph tubes to structured-grid density and fiber fields."""
+        if elem_centers_xyz.ndim != 2 or elem_centers_xyz.shape[-1] != 3:
+            raise ValueError("elem_centers_xyz must have shape [numElems, 3].")
+        if not elem_centers_xyz.is_floating_point():
+            raise TypeError("elem_centers_xyz must be a floating point tensor.")
+        if elem_centers_xyz.device != curves_xyz.device:
+            raise ValueError("elem_centers_xyz and curves_xyz must share a device.")
+        if elem_centers_xyz.dtype != curves_xyz.dtype:
+            raise ValueError("elem_centers_xyz and curves_xyz must share a dtype.")
+        if tau_distance <= 0.0 or tau_density <= 0.0 or tau_fiber <= 0.0:
+            raise ValueError("All distance, density, and fiber temperatures must be positive.")
+        if not 0.0 <= rho_min < 1.0:
+            raise ValueError("rho_min must satisfy 0 <= rho_min < 1.")
+
+        curve_points, curve_tangents = self.curve_points_and_tangents_xyz(
+            curves_xyz
+        )
+        distances = torch.cdist(elem_centers_xyz, curve_points)
+        tau_distance_t = elem_centers_xyz.new_tensor(float(tau_distance))
+        d_soft = -tau_distance_t * torch.logsumexp(
+            -distances / tau_distance_t, dim=1
+        )
+
+        radius_tensor = torch.as_tensor(
+            radius,
+            dtype=elem_centers_xyz.dtype,
+            device=elem_centers_xyz.device,
+        ).clamp_min(self.eps)
+        tau_density_t = elem_centers_xyz.new_tensor(float(tau_density))
+        occupancy = torch.sigmoid(
+            (radius_tensor - d_soft) / tau_density_t
+        )
+        density = float(rho_min) + (1.0 - float(rho_min)) * occupancy
+
+        tau_fiber_t = elem_centers_xyz.new_tensor(float(tau_fiber))
+        fiber_weights = torch.softmax(-distances / tau_fiber_t, dim=1)
+        fiber = fiber_weights @ curve_tangents
+        # Fiber direction is axis-like: f and -f are physically equivalent.
+        # Direct vector averaging is used for now; dyadic averaging can replace
+        # it later if tangent sign cancellation becomes problematic.
+        fiber = fiber / torch.linalg.vector_norm(
+            fiber, dim=1, keepdim=True
+        ).clamp_min(self.eps)
+
+        ax, ay, az = fiber.unbind(dim=1)
+        phi = torch.atan2(ay, ax)
+        theta = torch.acos(az.clamp(-1.0 + 1e-6, 1.0 - 1e-6))
+        return {
+            "density": density,
+            "fiber": fiber,
+            "phi": phi,
+            "theta": theta,
+            "distance": d_soft,
+        }
+
+    def graph_tube_fem_fields(
+        self,
+        seeds_uv: torch.Tensor,
+        cad_domain: Any,
+        elem_centers_xyz: torch.Tensor,
+        radius: torch.Tensor | float,
+        topology_mode: str = "scipy",
+        n_samples: int = 128,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+        tau_distance: float = 0.01,
+        tau_density: float = 0.01,
+        tau_fiber: float = 0.01,
+        rho_min: float = 1e-3,
+    ) -> dict[str, Any]:
+        """Build differentiable FEM density and orientation fields from seeds.
+
+        Geometry, density, fiber direction, and radius are differentiable for
+        fixed topology. SciPy topology, graph pruning, edge typing, and shell
+        corner routing remain discrete/local choices.
+        """
+        out = self(
+            seeds_uv,
+            topology_mode=topology_mode,
+            cad_domain=cad_domain,
+            return_xyz=True,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
+        graph = out["graph"]
+        curves_uv = self.sample_graph_edge_curves_uv(
+            seeds_uv=seeds_uv,
+            graph=graph,
+            n_samples=n_samples,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
+        curves_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv)
+        fields = self.soft_tube_density_and_fiber_to_elements(
+            elem_centers_xyz=elem_centers_xyz,
+            curves_xyz=curves_xyz,
+            radius=radius,
+            tau_distance=tau_distance,
+            tau_density=tau_density,
+            tau_fiber=tau_fiber,
+            rho_min=rho_min,
+        )
+        fields.update({
+            "curves_uv": curves_uv,
+            "curves_xyz": curves_xyz,
+            "graph": graph,
+            "decoder_out": out,
+        })
+        return fields
+
+    def plot_tube_curves_pyvista(
+        self,
+        curves_xyz: torch.Tensor,
+        radius: float = 0.01,
+    ):
+        """Visualize curve tubes with PyVista; never use this in training."""
+        if curves_xyz.ndim != 3 or curves_xyz.shape[-1] != 3:
+            raise ValueError("curves_xyz must have shape [E, K, 3].")
+        if radius <= 0.0:
+            raise ValueError("radius must be greater than zero.")
+        try:
+            import pyvista as pv
+        except ImportError as error:
+            raise ImportError(
+                "PyVista is required for plot_tube_curves_pyvista()."
+            ) from error
+
+        curves_np = curves_xyz.detach().cpu().numpy()
+        plotter = pv.Plotter()
+        for curve in curves_np:
+            line = pv.lines_from_points(curve)
+            plotter.add_mesh(line.tube(radius=float(radius)), smooth_shading=True)
+        plotter.add_axes()
+        plotter.show()
+        return plotter
+
+    def plot_fem_density_and_fiber_pyvista(
+        self,
+        elem_centers_xyz: torch.Tensor,
+        density: torch.Tensor,
+        fiber: torch.Tensor,
+        density_threshold: float = 0.2,
+    ):
+        """Visualize dense FEM centers and fiber glyphs; debugging only."""
+        if elem_centers_xyz.ndim != 2 or elem_centers_xyz.shape[-1] != 3:
+            raise ValueError("elem_centers_xyz must have shape [numElems, 3].")
+        if density.ndim != 1 or density.shape[0] != elem_centers_xyz.shape[0]:
+            raise ValueError("density must have shape [numElems].")
+        if fiber.shape != elem_centers_xyz.shape:
+            raise ValueError("fiber must have shape [numElems, 3].")
+        try:
+            import pyvista as pv
+        except ImportError as error:
+            raise ImportError(
+                "PyVista is required for plot_fem_density_and_fiber_pyvista()."
+            ) from error
+
+        centers_np = elem_centers_xyz.detach().cpu().numpy()
+        density_np = density.detach().cpu().numpy()
+        fiber_np = fiber.detach().cpu().numpy()
+        keep = density_np > float(density_threshold)
+        cloud = pv.PolyData(centers_np[keep])
+        cloud["density"] = density_np[keep]
+        cloud["fiber"] = fiber_np[keep]
+
+        plotter = pv.Plotter()
+        if cloud.n_points > 0:
+            plotter.add_mesh(
+                cloud,
+                scalars="density",
+                cmap="viridis",
+                point_size=8,
+                render_points_as_spheres=True,
+            )
+            span = centers_np.max(axis=0) - centers_np.min(axis=0)
+            glyph_scale = max(float((span * span).sum() ** 0.5) * 0.03, self.eps)
+            arrows = cloud.glyph(orient="fiber", scale=False, factor=glyph_scale)
+            plotter.add_mesh(arrows, color="orange")
+        plotter.add_axes()
+        plotter.show()
+        return plotter
+
     def _sharpen_seed_activity(self, weights: torch.Tensor) -> torch.Tensor:
         weights = weights.clamp(0.0, 1.0)
         if self.seed_activity_sharpness == 1.0:
@@ -1577,7 +2181,10 @@ class ContinuousVoronoiDecoder(nn.Module):
             ids = ordered_ids.tolist()
             edges_list.extend([[int(a), int(b)] for a, b in zip(ids, ids[1:] + ids[:1]) if a != b])
         edge_index = torch.as_tensor(edges_list, dtype=torch.long, device=device).reshape(-1, 2)
-        return edge_index, torch.full((edge_index.shape[0],), 2, dtype=torch.long, device=device)
+        # edge_type contract:
+        #   0 interior Voronoi, 1 clipped interior-boundary, 2 reserved,
+        #   3 clipped boundary-boundary, 4 boundary shell / UV-box loop.
+        return edge_index, torch.full((edge_index.shape[0],), 4, dtype=torch.long, device=device)
 
     def differentiable_vertices_from_triples(
         self,
@@ -1648,6 +2255,9 @@ class ContinuousVoronoiDecoder(nn.Module):
                 "edge_index": edges,
                 "edge_seed_pair": edge_seed_pairs,
                 "edge_alpha": full_edge_alpha,
+                "edge_type": torch.zeros(
+                    edges.shape[0], dtype=torch.long, device=device
+                ),
                 "num_interior_nodes": V,
                 "num_boundary_nodes": 0,
             }
@@ -1750,6 +2360,9 @@ class ContinuousVoronoiDecoder(nn.Module):
                 "edge_index": edges,
                 "edge_seed_pair": edge_seed_pairs,
                 "edge_alpha": full_edge_alpha,
+                "edge_type": torch.zeros(
+                    edges.shape[0], dtype=torch.long, device=device
+                ),
                 "num_interior_nodes": V,
                 "num_boundary_nodes": 0,
             }
@@ -1782,6 +2395,10 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         full_edge_index = torch.cat([edges, boundary_edges_t], dim=0)
         full_edge_seed_pair = torch.cat([edge_seed_pairs, boundary_seed_pairs_t], dim=0)
+        full_edge_type = torch.cat((
+            torch.zeros(edges.shape[0], dtype=torch.long, device=device),
+            torch.ones(boundary_edges_t.shape[0], dtype=torch.long, device=device),
+        ))
 
         full_edge_alpha = (
             node_alpha[full_edge_index[:, 0]]
@@ -1803,6 +2420,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             "edge_index": full_edge_index,
             "edge_seed_pair": full_edge_seed_pair,
             "edge_alpha": full_edge_alpha,
+            "edge_type": full_edge_type,
             "num_interior_nodes": V,
             "num_boundary_nodes": boundary_vertices_t.shape[0],
         }
@@ -1829,12 +2447,15 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise TypeError("seeds_uv must be a floating point tensor.")
 
         want_xyz = self.return_xyz if return_xyz is None else bool(return_xyz)
-        topo = self.build_scipy_voronoi_topology(
-            seeds_uv,
-            cad_domain=cad_domain,
-            u_periodic=u_periodic,
-            v_periodic=v_periodic,
-        )
+        # SciPy connectivity is a discrete choice. Rebuild it as needed, but
+        # never place topology construction on the autograd graph.
+        with torch.no_grad():
+            topo = self.build_scipy_voronoi_topology(
+                seeds_uv,
+                cad_domain=cad_domain,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+            )
         vertices_uv = self.differentiable_vertices_from_topology(
             seeds_uv=seeds_uv,
             vertex_type=topo["vertex_type"],
@@ -2063,6 +2684,25 @@ class ContinuousVoronoiDecoder(nn.Module):
         }
         out.update(topo["diagnostics"])
 
+        if edges.numel() > 0:
+            # SciPy connectivity is discrete, but these sampled curve
+            # coordinates remain differentiable with respect to the seeds.
+            out["edge_curves_uv"] = self.sample_graph_edge_curves_uv(
+                seeds_uv=seeds_uv,
+                graph=graph,
+                n_samples=64,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+            )
+            if (
+                cad_domain is not None
+                and want_xyz
+                and callable(getattr(cad_domain, "eval_uv_norm_batch_torch", None))
+            ):
+                out["edge_curves_xyz"] = self.sample_smooth_edge_curves_xyz(
+                    cad_domain, out["edge_curves_uv"]
+                )
+
         if cad_domain is not None and want_xyz:
             xyz = cad_domain.eval_uv_norm_batch(vertices_uv, return_inside_mask=False)["xyz"]
             out["vertices_xyz"] = torch.as_tensor(xyz, dtype=seeds_uv.dtype, device=seeds_uv.device)
@@ -2290,6 +2930,27 @@ class ContinuousVoronoiDecoder(nn.Module):
             "boundary_source_name": graph["boundary_source_name"],
             "mode": "soft",
         }
+
+        edge_index = graph["edge_index"]
+        edge_seed_pairs = graph["edge_seed_pair"]
+        if edge_index.numel() > 0:
+            # Graph topology is discrete; Hermite endpoint/tangent geometry is
+            # pure Torch and therefore differentiable with respect to seeds.
+            out["edge_curves_uv"] = self.sample_graph_edge_curves_uv(
+                seeds_uv=seeds_uv,
+                graph=graph,
+                n_samples=64,
+                u_periodic=u_periodic,
+                v_periodic=v_periodic,
+            )
+            if (
+                cad_domain is not None
+                and want_xyz
+                and callable(getattr(cad_domain, "eval_uv_norm_batch_torch", None))
+            ):
+                out["edge_curves_xyz"] = self.sample_smooth_edge_curves_xyz(
+                    cad_domain, out["edge_curves_uv"]
+                )
 
         if cad_domain is not None and want_xyz:
             xyz = cad_domain.eval_uv_norm_batch(P_uv, return_inside_mask=False)["xyz"]
@@ -2648,10 +3309,11 @@ class ContinuousVoronoiDecoder(nn.Module):
     @staticmethod
     def _generated_graph_edge_style(edge_type: int) -> tuple[str, str, str]:
         styles = {
-            0: ("black", "-", "Finite Voronoi edge"),
-            1: ("tab:orange", "-", "Clipped interior-boundary edge"),
-            2: ("tab:blue", "--", "Boundary domain edge"),
-            3: ("tab:green", "-.", "Clipped boundary-boundary Voronoi edge"),
+            0: ("black", "-", "Interior Voronoi edge"),
+            1: ("tab:orange", "-", "Clipped interior-boundary Voronoi edge"),
+            2: ("0.5", ":", "Reserved edge type"),
+            3: ("tab:orange", "-", "Clipped boundary-boundary Voronoi edge"),
+            4: ("tab:cyan", "--", "Boundary shell edge"),
         }
         return styles.get(int(edge_type), ("0.5", ":", f"Edge type {edge_type}"))
 
@@ -2664,6 +3326,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         show_edge_ids: bool = False,
         node_id_fontsize: int = 9,
         show_pruned_nodes: bool = False,
+        color_by_edge_type: bool = True,
     ):
         """Draw only the compact graph represented by ``out['graph']``."""
         graph = out["graph"]
@@ -2680,7 +3343,11 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         for edge_id, ((source, target), edge_type) in enumerate(zip(edges, edge_types)):
             source, target = int(source), int(target)
-            color, linestyle, _ = self._generated_graph_edge_style(int(edge_type))
+            color, linestyle, _ = (
+                self._generated_graph_edge_style(int(edge_type))
+                if color_by_edge_type
+                else ("black", "-", "Graph edge")
+            )
             ax.plot(
                 [nodes[source, 0], nodes[target, 0]],
                 [nodes[source, 1], nodes[target, 1]],
@@ -2748,7 +3415,7 @@ class ContinuousVoronoiDecoder(nn.Module):
                 )
 
         edge_handles = []
-        for edge_type in range(4):
+        for edge_type in range(5):
             color, linestyle, label = self._generated_graph_edge_style(edge_type)
             edge_handles.append(Line2D([0], [0], color=color, linestyle=linestyle, label=label))
         handles, labels = ax.get_legend_handles_labels()
@@ -2809,13 +3476,14 @@ class ContinuousVoronoiDecoder(nn.Module):
         node_id_fontsize: int = 9,
         print_node_table: bool = True,
         show_pruned_nodes: bool = False,
+        color_by_edge_type: bool = True,
     ):
         if out is None:
             out = self(seeds_uv, topology_mode="scipy", cad_domain=cad_domain, return_xyz=False)
         fig, ax = plt.subplots(figsize=(8, 8))
         self._draw_generated_graph(
             ax, seeds_uv, out, show_node_ids, show_edge_ids,
-            node_id_fontsize, show_pruned_nodes,
+            node_id_fontsize, show_pruned_nodes, color_by_edge_type,
         )
         plt.show()
         if print_node_table:
@@ -2832,6 +3500,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         node_id_fontsize: int = 9,
         print_node_table: bool = True,
         show_pruned_nodes: bool = False,
+        color_by_edge_type: bool = True,
     ):
         """Plot the generated graph abstraction without a SciPy background."""
         return self.plot_graph_output(
@@ -2843,6 +3512,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             node_id_fontsize=node_id_fontsize,
             print_node_table=print_node_table,
             show_pruned_nodes=show_pruned_nodes,
+            color_by_edge_type=color_by_edge_type,
         )
 
     def plot_scipy_vs_generated_graph(
@@ -2855,6 +3525,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         node_id_fontsize: int = 9,
         print_node_table: bool = True,
         show_pruned_nodes: bool = False,
+        color_by_edge_type: bool = True,
     ):
         if out is None:
             out = self(seeds_uv, topology_mode="scipy", cad_domain=cad_domain, return_xyz=False)
@@ -2884,7 +3555,7 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         self._draw_generated_graph(
             middle, seeds_uv, out, show_node_ids, show_edge_ids,
-            node_id_fontsize, show_pruned_nodes,
+            node_id_fontsize, show_pruned_nodes, color_by_edge_type,
         )
         middle.set_facecolor("none")
         middle.patch.set_alpha(0.0)
