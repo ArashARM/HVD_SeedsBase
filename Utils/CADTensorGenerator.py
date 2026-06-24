@@ -111,15 +111,25 @@ class CADTensorGenerator:
 
     def __init__(
         self,
+        shape_path: str | None = None,
         metric_tol: float = 1e-9,
         device: str = "cpu",
         seed_domain_mask_res: int = 128,
         seed_domain_trim_tol: float = 1e-7,
+        mesh_n_u: int = 80,
+        mesh_n_v: int = 40,
+        mesh_size_scale: float = 1.0,
+        mesh_algorithm: int = 6,
     ):
+        self.shape_path = None if shape_path is None else os.fspath(shape_path)
         self.metric_tol = float(metric_tol)
         self.device = device
         self.seed_domain_mask_res = int(seed_domain_mask_res)
         self.seed_domain_trim_tol = float(seed_domain_trim_tol)
+        self.mesh_n_u = int(mesh_n_u)
+        self.mesh_n_v = int(mesh_n_v)
+        self.mesh_size_scale = float(mesh_size_scale)
+        self.mesh_algorithm = int(mesh_algorithm)
 
         self._active_shape = None
         self._active_face = None
@@ -652,7 +662,49 @@ class CADTensorGenerator:
             "xyz": xyz.reshape(*original_shape, 3),
         }
 
-    def sample_shell_tensors(
+    def estimate_face_target_size(self, face, n_u=None, n_v=None):
+        """Estimate a representative physical mesh spacing from CAD UV samples."""
+        n_u = self.mesh_n_u if n_u is None else int(n_u)
+        n_v = self.mesh_n_v if n_v is None else int(n_v)
+        if n_u < 2 or n_v < 2:
+            raise ValueError(f"n_u and n_v must be at least 2, got {n_u}, {n_v}")
+
+        def bbox_fallback():
+            box = Bnd_Box()
+            brepbndlib.Add(face, box)
+            xmin, ymin, zmin, xmax, ymax, zmax = map(float, box.Get())
+            diagonal = float(np.linalg.norm([xmax - xmin, ymax - ymin, zmax - zmin]))
+            return diagonal / float(max(n_u, n_v, 1))
+
+        try:
+            umin, umax, vmin, vmax = map(float, breptools.UVBounds(face))
+            surface = BRep_Tool.Surface(face)
+            if (
+                not np.isfinite([umin, umax, vmin, vmax]).all()
+                or abs(umax - umin) < 1e-30
+                or abs(vmax - vmin) < 1e-30
+            ):
+                return bbox_fallback()
+
+            u_values = np.linspace(umin, umax, n_u, dtype=np.float64)
+            v_values = np.linspace(vmin, vmax, n_v, dtype=np.float64)
+            points = np.empty((n_v, n_u, 3), dtype=np.float64)
+            for j, v in enumerate(v_values):
+                for i, u in enumerate(u_values):
+                    point = surface.Value(float(u), float(v))
+                    points[j, i] = [point.X(), point.Y(), point.Z()]
+
+            u_lengths = np.linalg.norm(np.diff(points, axis=1), axis=-1).reshape(-1)
+            v_lengths = np.linalg.norm(np.diff(points, axis=0), axis=-1).reshape(-1)
+            lengths = np.concatenate((u_lengths, v_lengths))
+            lengths = lengths[np.isfinite(lengths) & (lengths > 0.0)]
+            if lengths.size == 0:
+                return bbox_fallback()
+            return float(np.mean(lengths))
+        except Exception:
+            return bbox_fallback()
+
+    def build_face_mesh_tensors(
         self,
         res: int = 96,
         mesh_size: float | None = None,
@@ -661,15 +713,15 @@ class CADTensorGenerator:
         """Create and cache one Gmsh surface mesh for ``ThickenShell``.
 
         The first call meshes the active STEP/IGES face. Subsequent calls with
-        the same resolution/mesh size return the exact cached tensor objects,
+        the same mesh settings return the exact cached tensor objects,
         so an optimization loop can reuse them without invoking Gmsh again.
-        ``res`` only supplies a default physical mesh size; pass ``mesh_size``
-        to control it directly in CAD units.
+        Pass ``mesh_size`` to control the target element size directly in CAD
+        units. ``res`` is retained for call-site compatibility.
         """
         self._require_active_face()
         if gmsh is None:
             raise ImportError(
-                "Gmsh is required for sample_shell_tensors(); install the Python "
+                "Gmsh is required for build_face_mesh_tensors(); install the Python "
                 "package 'gmsh' in the notebook environment."
             )
         if self._active_shape_path is None:
@@ -682,16 +734,23 @@ class CADTensorGenerator:
         box = Bnd_Box()
         brepbndlib.Add(self._active_face, box)
         xmin, ymin, zmin, xmax, ymax, zmax = map(float, box.Get())
-        diagonal = float(np.linalg.norm([xmax - xmin, ymax - ymin, zmax - zmin]))
         target_size = (
             float(mesh_size)
             if mesh_size is not None
-            else diagonal / float(max(res - 1, 1))
+            else self.mesh_size_scale * self.estimate_face_target_size(
+                self._active_face,
+                n_u=self.mesh_n_u,
+                n_v=self.mesh_n_v,
+            )
         )
         if target_size <= 0.0:
-            raise ValueError(f"mesh_size must be positive, got {target_size}")
+            raise ValueError(f"mesh target size must be positive, got {target_size}")
 
-        cache_key = (os.path.abspath(self._active_shape_path), target_size)
+        cache_key = (
+            os.path.abspath(self._active_shape_path),
+            float(target_size),
+            int(self.mesh_algorithm),
+        )
         if (
             not force_remesh
             and self._shell_tensors_cache is not None
@@ -714,9 +773,13 @@ class CADTensorGenerator:
                     f"Expected Gmsh to import one CAD face, got {len(surfaces)}."
                 )
             surface_tag = int(surfaces[0][1])
+            gmsh.option.setNumber("Mesh.Algorithm", int(self.mesh_algorithm))
+            gmsh.option.setNumber("Mesh.ElementOrder", 1)
             gmsh.option.setNumber("Mesh.MeshSizeMin", target_size)
             gmsh.option.setNumber("Mesh.MeshSizeMax", target_size)
-            gmsh.option.setNumber("Mesh.ElementOrder", 1)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
             gmsh.model.mesh.generate(2)
 
             node_tags, _coords, uv_raw_flat = gmsh.model.mesh.getNodes(
@@ -834,17 +897,28 @@ class CADTensorGenerator:
         self._shell_mesh_cache_key = cache_key
         return shell_tensors
 
+    def sample_shell_tensors(self, *args, **kwargs):
+        return self.build_face_mesh_tensors(*args, **kwargs)
+
     # =========================================================================
     # 5) Decoder contract
     # =========================================================================
 
-    def generate_from_file(self, shape_path: str):
+    def generate_from_file(self, shape_path: str | None = None):
         """
-        Load a single-face CAD file and return continuous trimmed UV metadata.
+        Load a single-face CAD file and return UV metadata plus mesh tensors.
 
         No mesh vertices, mesh faces, nearest-neighbor projections, or
         selected-face logic appear in this decoder path.
         """
+        if shape_path is None:
+            shape_path = self.shape_path
+        if shape_path is None:
+            raise ValueError(
+                "shape_path must be provided either to the constructor or generate_from_file()."
+            )
+        self.shape_path = os.fspath(shape_path)
+
         shape = self.load_shape(shape_path)
         face = self.get_single_face(shape)
         (umin, umax, vmin, vmax), surf = self.face_uv_bounds_and_surface(face)
@@ -897,7 +971,7 @@ class CADTensorGenerator:
         self._shell_tensors_cache = None
         self._shell_mesh_cache_key = None
 
-        return {
+        domain = {
             "u_raw_bounds": self._active_u_raw_bounds,
             "v_raw_bounds": self._active_v_raw_bounds,
             "seed_domain_mask_grid": self._seed_domain_mask_grid,
@@ -909,6 +983,9 @@ class CADTensorGenerator:
             "u_period": self._u_period,
             "v_period": self._v_period,
         }
+        tensors = self.build_face_mesh_tensors()
+        return domain, tensors
+
     def print_face_info(self):
         self._require_active_face()
 
@@ -948,3 +1025,4 @@ class CADTensorGenerator:
         )
 
         print("========================\n")
+        return dx,dy,dz
