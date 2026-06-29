@@ -11,14 +11,8 @@ from scipy.spatial import Delaunay, Voronoi, voronoi_plot_2d, cKDTree
 class ContinuousVoronoiDecoder(nn.Module):
     """Differentiable UV Voronoi decoder using SciPy topology and Torch geometry."""
 
-    def __init__(self, face_mesh: Any | None=None, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True, return_xyz: bool=True, vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, tube_cdist_max_values: int=4096, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, **unused_kwargs: Any):
+    def __init__(self, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True, return_xyz: bool=True, vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, **unused_kwargs: Any):
         super().__init__()
-        if isinstance(face_mesh, (float, int)):
-            eps = float(face_mesh)
-            face_mesh = None
-        if face_mesh is None and self._looks_like_legacy_eps(eps) and not isinstance(eps, (float, int)):
-            face_mesh = eps
-            eps = 1e-08
         self.eps = float(eps)
         self.solve_reg = float(solve_reg)
         self.tau_voronoi = float(tau_voronoi)
@@ -43,76 +37,9 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.tube_distance_tau = self.centerline_softmin_tau if tube_distance_tau is None else float(tube_distance_tau)
         self.tube_density_tau = self.centerline_beta if tube_density_tau is None else float(tube_density_tau)
         self.tube_fiber_tau = self.tube_distance_tau if tube_fiber_tau is None else float(tube_fiber_tau)
-        self.tube_cdist_max_values = max(int(tube_cdist_max_values), 1)
         self.rho_min = float(rho_min)
         self.face_u_periodic = face_u_periodic
         self.face_v_periodic = face_v_periodic
-        self.face_mesh: Any | None = None
-        self.mesh_info: dict[str, Any] = {}
-        self.register_buffer('point_Xyz', None)
-        self.register_buffer('point_UV', None)
-        self.register_buffer('Xu', None)
-        self.register_buffer('Xv', None)
-        self.register_buffer('XV', None)
-        self.register_buffer('face_areas', None)
-        self.register_buffer('faces_ijk', None)
-        self.register_buffer('pv_faces', None)
-        self.register_buffer('face_id', None)
-        self.register_buffer('boundary_idx_ring1', None)
-        self.register_buffer('min_vol_frac', None)
-        if face_mesh is not None:
-            self.set_face_mesh(face_mesh)
-
-    @staticmethod
-    def _looks_like_legacy_eps(value: Any) -> bool:
-        return isinstance(value, dict) or hasattr(value, 'keys')
-
-    @staticmethod
-    def _mesh_get(face_mesh: Any, *names: str) -> Any:
-        if face_mesh is None:
-            return None
-        for name in names:
-            if isinstance(face_mesh, dict) and name in face_mesh:
-                return face_mesh[name]
-            if hasattr(face_mesh, name):
-                return getattr(face_mesh, name)
-        return None
-
-    def _set_buffer_value(self, name: str, value: Any) -> None:
-        tensor = None if value is None else torch.as_tensor(value)
-        if name in self._buffers:
-            self._buffers[name] = tensor
-        else:
-            self.register_buffer(name, tensor)
-
-    def set_face_mesh(self, face_mesh: Any) -> None:
-        """Cache face mesh tensors on the decoder for repeated evaluations."""
-        self.face_mesh = face_mesh
-        points_xyz = self._mesh_get(face_mesh, 'points_xyz', 'point_Xyz', 'point_xyz', 'xyz', 'points_3d')
-        points_uv = self._mesh_get(face_mesh, 'points_uv', 'point_UV', 'uv', 'uv_norm')
-        Xu = self._mesh_get(face_mesh, 'Xu', 'xu')
-        Xv = self._mesh_get(face_mesh, 'Xv', 'XV', 'xv')
-        self._set_buffer_value('point_Xyz', points_xyz)
-        self._set_buffer_value('point_UV', points_uv)
-        self._set_buffer_value('Xu', Xu)
-        self._set_buffer_value('Xv', Xv)
-        self._set_buffer_value('XV', Xv)
-        for name in ('face_areas', 'faces_ijk', 'pv_faces', 'face_id', 'boundary_idx_ring1', 'min_vol_frac'):
-            self._set_buffer_value(name, self._mesh_get(face_mesh, name))
-        self.mesh_info = {}
-        if isinstance(face_mesh, dict):
-            for key, value in face_mesh.items():
-                if not isinstance(value, torch.Tensor):
-                    self.mesh_info[key] = value
-        BBX = self._mesh_get(face_mesh, 'BBX', 'bbox', 'bounds')
-        if BBX is not None:
-            self.mesh_info['BBX'] = BBX
-
-    def _cached_mesh_tensor(self, name: str, dtype: torch.dtype, device: torch.device) -> torch.Tensor | None:
-        value = getattr(self, name, None)
-        if value is None:
-            return None
-        return value.to(dtype=dtype, device=device) if value.is_floating_point() else value.to(device=device)
 
     @staticmethod
     def _bool_value(value: Any) -> bool:
@@ -352,22 +279,12 @@ class ContinuousVoronoiDecoder(nn.Module):
         return xyz.reshape(*original_shape, 3)
 
     def width(self, w_raw: torch.Tensor, seeds: torch.Tensor | None=None, **_: Any) -> torch.Tensor:
-        """Map raw width to a UV radius matrix.
-
-        ``w_raw == 0`` means no tube radius is added around the core graph
-        curves. Increasing positive values grow the radius up to the local
-        seed-spacing cap.
-        """
+        """Map global raw width to a UV radius matrix compatible with the old trainer."""
         if w_raw.ndim != 2 or w_raw.shape[0] != w_raw.shape[1]:
             raise ValueError(f'w_raw must be square [S,S], got {tuple(w_raw.shape)}.')
-        def zero_centered_positive(raw: torch.Tensor) -> torch.Tensor:
-            temp = max(float(self.raw_temp), self.eps)
-            shifted = F.softplus(raw / temp) - raw.new_tensor(np.log(2.0))
-            return torch.tanh(shifted.clamp_min(0.0))
         if seeds is None:
             width_raw_global = w_raw.mean()
-            width_frac = zero_centered_positive(width_raw_global)
-            w_geo = torch.as_tensor(self.w_min, dtype=w_raw.dtype, device=w_raw.device) * width_frac
+            w_geo = torch.as_tensor(self.w_min, dtype=w_raw.dtype, device=w_raw.device) * F.softplus(width_raw_global).clamp_min(1.0)
             return w_geo.expand_as(w_raw)
         if seeds.ndim != 2 or seeds.shape[-1] != 2:
             raise ValueError('seeds must have shape [S, 2].')
@@ -381,8 +298,9 @@ class ContinuousVoronoiDecoder(nn.Module):
             width_raw_global = w_raw.mean()
         w_min = torch.as_tensor(self.w_min, dtype=w_raw.dtype, device=w_raw.device)
         w_max = (float(self.w_max_ratio) * cap_pair_dist).clamp_min(w_min)
-        width_frac = zero_centered_positive(width_raw_global)
-        w_geo = w_max * width_frac
+        temp = max(float(self.raw_temp), self.eps)
+        width_frac = 0.5 * (torch.tanh(width_raw_global / temp) + 1.0)
+        w_geo = w_min + (w_max - w_min) * width_frac
         return w_geo.expand_as(w_raw)
 
     def _local_uv_to_xyz_scale(self, Xu: torch.Tensor | None, Xv: torch.Tensor | None, ref_xyz: torch.Tensor) -> torch.Tensor:
@@ -405,7 +323,7 @@ class ContinuousVoronoiDecoder(nn.Module):
     def build_swept_tube_fields(
         self,
         points_uv: torch.Tensor,
-        points_3d: torch.Tensor | None,
+        points_3d: torch.Tensor,
         seeds_uv: torch.Tensor,
         w_raw: torch.Tensor,
         Xu: torch.Tensor | None=None,
@@ -414,65 +332,27 @@ class ContinuousVoronoiDecoder(nn.Module):
         u_periodic: bool=False,
         v_periodic: bool=False,
         return_xyz: bool=True,
-        compute_fields: bool=True,
     ) -> dict[str, Any]:
         topo_out = self.forward_scipy_topology(
             seeds_uv=seeds_uv,
             cad_domain=cad_domain,
             u_periodic=u_periodic,
             v_periodic=v_periodic,
-            return_xyz=return_xyz and compute_fields,
+            return_xyz=return_xyz,
             keep_isolated_vertices=False,
         )
         w_geo = self.width(w_raw, seeds=seeds_uv)
         width_uv = self._pair_upper_mean(w_geo)
-        if not return_xyz:
-            curves_uv = topo_out.get('edge_curves_uv', points_uv.new_empty((0, max(int(self.tube_curve_samples), 2), 2)))
-            out = dict(topo_out)
-            out.update({
-                'seeds': seeds_uv,
-                'seeds_uv': seeds_uv,
-                'w_geo': w_geo,
-                'centerline_radius': width_uv,
-                'edge_curves_uv': curves_uv,
-            })
-            if curves_uv.shape[0] > 0 and cad_domain is not None and callable(getattr(cad_domain, 'eval_uv_norm_batch_torch', None)):
-                out['edge_curves_xyz'] = self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv)
-            return out
-        curves_uv = topo_out.get('edge_curves_uv')
-        if curves_uv is None:
-            curves_uv = points_uv.new_empty((0, max(int(self.tube_curve_samples), 2), 2))
-        use_torch_cad = cad_domain is not None and callable(getattr(cad_domain, 'eval_uv_norm_batch_torch', None))
-        if not compute_fields:
-            if use_torch_cad:
-                curves_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv) if curves_uv.shape[0] > 0 else seeds_uv.new_empty((0, curves_uv.shape[1], 3))
-                seeds_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, seeds_uv.reshape(-1, 1, 2)).reshape(-1, 3)
-            else:
-                if points_3d is None:
-                    raise ValueError('points_3d/points_xyz must be provided for return_xyz=True when cad_domain has no torch XYZ evaluator.')
-                curves_xyz = self.soft_lift_uv_to_xyz(curves_uv, points_uv, points_3d, u_periodic=u_periodic, v_periodic=v_periodic) if curves_uv.shape[0] > 0 else points_3d.new_empty((0, curves_uv.shape[1], 3))
-                seeds_xyz = self.soft_lift_uv_to_xyz(seeds_uv, points_uv, points_3d, u_periodic=u_periodic, v_periodic=v_periodic)
-            out = dict(topo_out)
-            out.update({
-                'seeds': seeds_uv,
-                'seeds_uv': seeds_uv,
-                'seeds_xyz': seeds_xyz,
-                'w_geo': w_geo,
-                'centerline_radius': width_uv,
-                'edge_curves_uv': curves_uv,
-                'edge_curves_xyz': curves_xyz,
-            })
-            return out
-        if points_3d is None:
-            raise ValueError('points_3d/points_xyz must be provided when return_xyz=True.')
         local_scale = self._local_uv_to_xyz_scale(Xu, Xv, points_3d)
-        radius_3d = width_uv * local_scale
+        radius_3d = (width_uv * local_scale).clamp_min(self.eps)
         tau_distance = max(float(self.tube_distance_tau), self.eps) * local_scale.clamp_min(self.eps)
         tau_density = max(float(self.tube_density_tau), self.eps) * local_scale.clamp_min(self.eps)
         tau_fiber = max(float(self.tube_fiber_tau), self.eps) * local_scale.clamp_min(self.eps)
         min_tube_samples = max(int(self.tube_curve_samples), 2)
-        if curves_uv.shape[1] != min_tube_samples and curves_uv.shape[0] == 0:
+        curves_uv = topo_out.get('edge_curves_uv')
+        if curves_uv is None:
             curves_uv = points_uv.new_empty((0, min_tube_samples, 2))
+        use_torch_cad = cad_domain is not None and callable(getattr(cad_domain, 'eval_uv_norm_batch_torch', None))
         if curves_uv.shape[0] > 0:
             if curves_uv.shape[1] != min_tube_samples:
                 curves_uv = self.sample_graph_edge_curves_uv(
@@ -638,51 +518,19 @@ class ContinuousVoronoiDecoder(nn.Module):
         radius_tensor = torch.as_tensor(radius, dtype=elem_centers_xyz.dtype, device=elem_centers_xyz.device).clamp_min(self.eps)
         tau_density_t = elem_centers_xyz.new_tensor(float(tau_density))
         tau_fiber_t = elem_centers_xyz.new_tensor(float(tau_fiber))
-        num_elements = int(elem_centers_xyz.shape[0])
-        num_curve_points = int(curve_points.shape[0])
-        nearest_k = min(16, num_curve_points)
-        max_cdist_values = max(int(self.tube_cdist_max_values), 1)
-        while True:
-            elem_chunk_size = max(1, min(num_elements, max_cdist_values // min(num_curve_points, max_cdist_values)))
-            curve_chunk_size = max(1, min(num_curve_points, max_cdist_values // elem_chunk_size))
-            distance_chunks = []
-            fiber_chunks = []
-            try:
-                for start in range(0, num_elements, elem_chunk_size):
-                    end = min(start + elem_chunk_size, num_elements)
-                    elem_chunk = elem_centers_xyz[start:end]
-                    nearest_distances = None
-                    nearest_ids = None
-                    for curve_start in range(0, num_curve_points, curve_chunk_size):
-                        curve_end = min(curve_start + curve_chunk_size, num_curve_points)
-                        distances = torch.cdist(
-                            elem_chunk,
-                            curve_points[curve_start:curve_end],
-                            compute_mode='donot_use_mm_for_euclid_dist',
-                        )
-                        local_k = min(nearest_k, curve_end - curve_start)
-                        local_distances, local_ids = torch.topk(distances, k=local_k, dim=1, largest=False)
-                        local_ids = local_ids + curve_start
-                        if nearest_distances is None or nearest_ids is None:
-                            nearest_distances = local_distances
-                            nearest_ids = local_ids
-                        else:
-                            candidate_distances = torch.cat((nearest_distances, local_distances), dim=1)
-                            candidate_ids = torch.cat((nearest_ids, local_ids), dim=1)
-                            nearest_distances, candidate_order = torch.topk(candidate_distances, k=nearest_k, dim=1, largest=False)
-                            nearest_ids = torch.gather(candidate_ids, 1, candidate_order)
-                    distance_chunks.append(nearest_distances[:, 0])
-                    fiber_weights = torch.softmax(-nearest_distances / tau_fiber_t, dim=1)
-                    nearest_tangents = curve_tangents[nearest_ids]
-                    fiber_chunks.append((fiber_weights.unsqueeze(-1) * nearest_tangents).sum(dim=1))
-                break
-            except torch.cuda.OutOfMemoryError:
-                if not elem_centers_xyz.is_cuda or max_cdist_values <= 1:
-                    raise
-                max_cdist_values = max(max_cdist_values // 2, 1)
-                distance_chunks.clear()
-                fiber_chunks.clear()
-                torch.cuda.empty_cache()
+        max_cdist_values = 16000000
+        chunk_size = max(1, min(int(elem_centers_xyz.shape[0]), max_cdist_values // max(int(curve_points.shape[0]), 1)))
+        distance_chunks = []
+        fiber_chunks = []
+        nearest_k = min(16, int(curve_points.shape[0]))
+        for start in range(0, int(elem_centers_xyz.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(elem_centers_xyz.shape[0]))
+            distances = torch.cdist(elem_centers_xyz[start:end], curve_points)
+            nearest_distances, nearest_ids = torch.topk(distances, k=nearest_k, dim=1, largest=False)
+            distance_chunks.append(nearest_distances[:, 0])
+            fiber_weights = torch.softmax(-nearest_distances / tau_fiber_t, dim=1)
+            nearest_tangents = curve_tangents[nearest_ids]
+            fiber_chunks.append((fiber_weights.unsqueeze(-1) * nearest_tangents).sum(dim=1))
         d_soft = torch.cat(distance_chunks, dim=0)
         occupancy = torch.sigmoid((radius_tensor - d_soft) / tau_density_t)
         density = float(rho_min) + (1.0 - float(rho_min)) * occupancy
@@ -1477,7 +1325,7 @@ class ContinuousVoronoiDecoder(nn.Module):
 
     def evaluate_at_uv(
         self,
-        points_uv: torch.Tensor | None=None,
+        points_uv: torch.Tensor,
         Xu: torch.Tensor | None=None,
         Xv: torch.Tensor | None=None,
         points_3d: torch.Tensor | None=None,
@@ -1488,35 +1336,20 @@ class ContinuousVoronoiDecoder(nn.Module):
         cad_domain: Any | None=None,
         u_periodic: bool | None=None,
         v_periodic: bool | None=None,
-        return_xyz: bool | None=None,
-        compute_fields: bool=True,
         **_: Any,
     ) -> dict[str, Any]:
         if seeds_raw is None:
             raise ValueError('seeds_raw must be provided for swept tube evaluation.')
         if w_raw is None:
             raise ValueError('w_raw must be provided for swept tube evaluation.')
-        ref_device = seeds_raw.device
-        ref_dtype = seeds_raw.dtype
-        if points_uv is None:
-            points_uv = self._cached_mesh_tensor('point_UV', dtype=ref_dtype, device=ref_device)
         if points_3d is None:
             points_3d = points_xyz
         if points_3d is None:
-            points_3d = self._cached_mesh_tensor('point_Xyz', dtype=ref_dtype, device=ref_device)
-        if Xu is None:
-            Xu = self._cached_mesh_tensor('Xu', dtype=ref_dtype, device=ref_device)
-        if Xv is None:
-            Xv = self._cached_mesh_tensor('Xv', dtype=ref_dtype, device=ref_device)
-        if points_uv is None:
-            raise ValueError('points_uv must be provided, either directly or through constructor face_mesh.')
-        points_uv = torch.as_tensor(points_uv, dtype=ref_dtype, device=ref_device)
-        want_xyz = True if return_xyz is None else bool(return_xyz)
-        if want_xyz and compute_fields and points_3d is None:
-            raise ValueError('points_3d/points_xyz must be provided, either directly or through constructor face_mesh.')
-        points_3d = None if points_3d is None else torch.as_tensor(points_3d, dtype=ref_dtype, device=ref_device)
-        Xu_t = None if Xu is None else torch.as_tensor(Xu, dtype=ref_dtype, device=ref_device)
-        Xv_t = None if Xv is None else torch.as_tensor(Xv, dtype=ref_dtype, device=ref_device)
+            raise ValueError('points_3d must be provided for swept tube evaluation.')
+        points_uv = torch.as_tensor(points_uv, dtype=seeds_raw.dtype, device=seeds_raw.device)
+        points_3d = torch.as_tensor(points_3d, dtype=seeds_raw.dtype, device=seeds_raw.device)
+        Xu_t = None if Xu is None else torch.as_tensor(Xu, dtype=seeds_raw.dtype, device=seeds_raw.device)
+        Xv_t = None if Xv is None else torch.as_tensor(Xv, dtype=seeds_raw.dtype, device=seeds_raw.device)
         use_u_periodic = self._bool_value(self.face_u_periodic) if u_periodic is None else bool(u_periodic)
         use_v_periodic = self._bool_value(self.face_v_periodic) if v_periodic is None else bool(v_periodic)
         return self.build_swept_tube_fields(
@@ -1529,8 +1362,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             cad_domain=cad_domain,
             u_periodic=use_u_periodic,
             v_periodic=use_v_periodic,
-            return_xyz=want_xyz,
-            compute_fields=compute_fields,
+            return_xyz=True,
         )
 
     def forward(
@@ -1551,7 +1383,6 @@ class ContinuousVoronoiDecoder(nn.Module):
         tau: float | torch.Tensor | None=None,
         seeds_raw: torch.Tensor | None=None,
         w_raw: torch.Tensor | None=None,
-        compute_fields: bool=True,
         **kwargs: Any,
     ) -> dict[str, Any]:
         if points_uv is not None or seeds_raw is not None or w_raw is not None:
@@ -1566,8 +1397,6 @@ class ContinuousVoronoiDecoder(nn.Module):
                 cad_domain=cad_domain,
                 u_periodic=u_periodic,
                 v_periodic=v_periodic,
-                return_xyz=return_xyz,
-                compute_fields=compute_fields,
                 **kwargs,
             )
         if not isinstance(seeds_uv, torch.Tensor):
