@@ -1,0 +1,11 @@
+Volume Metric Definitions
+=========================
+Legacy names in older logs:
+Tot_VolFrac = VF_total
+HVD_OFRAC / HVD_VolFrac = VF_int
+EFF_volfrac / Eff_VolFrac = VF_eff_int
+
+VF_total: Total volume fraction. Area-weighted mean density of the full shell field, including boundary attachment.
+VF_eff_total: Efficient total volume fraction. Area-weighted mean of the powered full shell density; lower density material contributes less.
+VF_int: Interior (Voronoi edges only) volume fraction. Area-weighted mean density of the interior Voronoi-edge field without boundary attachment.
+VF_eff_int: Efficient Interior (Voronoi edges only) volume fraction. Area-weighted mean of the powered interior Voronoi-edge density.

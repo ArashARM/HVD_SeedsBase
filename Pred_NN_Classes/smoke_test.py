@@ -15,13 +15,6 @@ def main():
     expected_keys = {
         "seeds_raw",
         "w_raw",
-        "h_raw",
-        "theta",
-        "a_raw",
-        "boundary_width_raw",
-        "boundary_alpha_raw",
-        "boundary_beta_raw",
-        "tau",
     }
     assert set(out.keys()) == expected_keys
     assert out["seeds_raw"].shape == (5, 2)

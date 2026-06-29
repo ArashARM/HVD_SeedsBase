@@ -901,7 +901,120 @@ class CADTensorGenerator:
         return self.build_face_mesh_tensors(*args, **kwargs)
 
     # =========================================================================
-    # 5) Decoder contract
+    # 5) Trainer helper contract
+    # =========================================================================
+
+    @staticmethod
+    def vertex_area_lumped(
+        num_vertices: int,
+        faces_ijk: torch.Tensor,
+        face_areas: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return barycentric lumped area per mesh vertex."""
+        device = faces_ijk.device
+        dtype = face_areas.dtype if face_areas.is_floating_point() else torch.float32
+        area = torch.zeros((int(num_vertices),), dtype=dtype, device=device)
+        if faces_ijk.numel() == 0:
+            return area
+        tri_area = face_areas.to(device=device, dtype=dtype).reshape(-1) / 3.0
+        contrib = tri_area[:, None].expand(-1, 3).reshape(-1)
+        return area.scatter_add(0, faces_ijk.reshape(-1).to(device=device), contrib)
+
+    @staticmethod
+    def fps_3d(
+        points_xyz: torch.Tensor,
+        n_samples: int,
+        exclude_idx=None,
+        seed: int | None = None,
+    ) -> torch.Tensor:
+        """Farthest-point sample indices from a 3D point cloud."""
+        points = points_xyz.detach()
+        device = points.device
+        n_points = int(points.shape[0])
+        n_samples = min(int(n_samples), n_points)
+        if n_samples <= 0:
+            return torch.empty((0,), dtype=torch.long, device=device)
+
+        candidate_mask = torch.ones((n_points,), dtype=torch.bool, device=device)
+        if exclude_idx is not None:
+            exclude_idx = torch.as_tensor(exclude_idx, dtype=torch.long, device=device)
+            exclude_idx = exclude_idx[(exclude_idx >= 0) & (exclude_idx < n_points)]
+            if exclude_idx.numel() > 0:
+                candidate_mask[exclude_idx] = False
+        candidates = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+        if candidates.numel() == 0:
+            candidates = torch.arange(n_points, dtype=torch.long, device=device)
+        n_samples = min(n_samples, int(candidates.numel()))
+
+        if seed is not None:
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(seed))
+            first_local = int(torch.randint(candidates.numel(), (1,), generator=gen).item())
+        else:
+            centroid = points[candidates].mean(dim=0, keepdim=True)
+            first_local = int(torch.argmax(torch.linalg.norm(points[candidates] - centroid, dim=1)).item())
+
+        selected = [candidates[first_local]]
+        min_dist = torch.cdist(points[candidates], points[selected[0]].reshape(1, 3)).reshape(-1)
+        selected_mask = torch.zeros((candidates.numel(),), dtype=torch.bool, device=device)
+        selected_mask[first_local] = True
+
+        for _ in range(1, n_samples):
+            scores = torch.where(selected_mask, torch.full_like(min_dist, -1.0), min_dist)
+            next_local = int(torch.argmax(scores).item())
+            selected_mask[next_local] = True
+            selected.append(candidates[next_local])
+            dist_new = torch.cdist(points[candidates], points[candidates[next_local]].reshape(1, 3)).reshape(-1)
+            min_dist = torch.minimum(min_dist, dist_new)
+
+        return torch.stack(selected).to(dtype=torch.long)
+
+    @staticmethod
+    def seeds_uv_to_xyz_nearest(
+        seeds_uv: torch.Tensor,
+        uv: torch.Tensor,
+        points_xyz: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map seed UVs to nearest mesh sample XYZ for visualization."""
+        seeds_uv = seeds_uv.to(device=uv.device, dtype=uv.dtype)
+        nn = torch.cdist(seeds_uv, uv).argmin(dim=1)
+        return points_xyz.to(device=uv.device)[nn]
+
+    def eval_face_uv_from_face_tensor(
+        self,
+        shape_or_path=None,
+        face_tensor=None,
+        uv_norm=None,
+        metric_tol: float | None = None,
+        trim_tol: float | None = None,
+        as_torch: bool = True,
+    ) -> dict:
+        """Evaluate normalized UV points on the active face.
+
+        ``face_tensor`` and ``shape_or_path`` are accepted for trainer
+        compatibility; this generator already owns the active CAD face.
+        """
+        if uv_norm is None:
+            if face_tensor is None:
+                raise ValueError("uv_norm or face_tensor must be provided.")
+            uv_norm = face_tensor["uv"]
+        out = self.eval_uv_norm(
+            uv_norm,
+            metric_tol=metric_tol,
+            trim_tol=trim_tol,
+            return_inside_mask=True,
+        )
+        out["valid_mask"] = out["inside_mask"].reshape(-1).to(dtype=torch.bool)
+        out["points_xyz"] = out["xyz"]
+        if as_torch:
+            return out
+        return {
+            key: value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else value
+            for key, value in out.items()
+        }
+
+    # =========================================================================
+    # 6) Decoder contract
     # =========================================================================
 
     def generate_from_file(self, shape_path: str | None = None):

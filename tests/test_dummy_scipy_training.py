@@ -195,7 +195,7 @@ def test_scipy_reconstructed_graph_geometry_has_seed_gradients() -> None:
     assert torch.all((trainer.seeds_uv >= 0.0) & (trainer.seeds_uv <= 1.0))
 
 
-def test_smooth_edge_curves_are_differentiable_and_handle_invalid_pairs() -> None:
+def test_smooth_edge_curves_are_differentiable_straight_segments() -> None:
     decoder = ContinuousVoronoiDecoder(return_xyz=False)
     seeds = torch.tensor(
         [[0.2, 0.3], [0.8, 0.3]], dtype=torch.float64, requires_grad=True
@@ -209,18 +209,44 @@ def test_smooth_edge_curves_are_differentiable_and_handle_invalid_pairs() -> Non
         seeds, vertices, edges, seed_pairs, n_samples=11
     )
 
+    s = torch.linspace(0.0, 1.0, 11, dtype=vertices.dtype).view(1, 11, 1)
+    expected = (1.0 - s) * vertices[edges[:, 0], None, :] + s * vertices[edges[:, 1], None, :]
+
     assert curves.shape == (2, 11, 2)
-    assert torch.allclose(curves[:, 0], vertices[edges[:, 0]])
-    assert torch.allclose(curves[:, -1], vertices[edges[:, 1]])
-    # The invalid-pair fallback follows the straight endpoint chord.
-    fallback_offsets = curves[1] - vertices[0]
-    fallback_cross = (
-        fallback_offsets[:, 0] * (vertices[1] - vertices[0])[1]
-        - fallback_offsets[:, 1] * (vertices[1] - vertices[0])[0]
-    )
-    assert torch.allclose(fallback_cross, torch.zeros_like(fallback_cross))
+    assert torch.allclose(curves, expected)
 
     curves.square().sum().backward()
+    assert seeds.grad is not None
+    assert torch.isfinite(seeds.grad).all()
+    assert torch.linalg.vector_norm(seeds.grad) > 0
+
+
+def test_graph_edge_curves_are_straight_and_differentiable_for_euclidean_edges() -> None:
+    decoder = ContinuousVoronoiDecoder(return_xyz=False)
+    seeds = irregular_test_seeds().requires_grad_(True)
+
+    out = decoder(seeds, topology_mode="scipy", return_xyz=False)
+    graph = out["graph"]
+    curves = decoder.sample_graph_edge_curves_uv(
+        seeds_uv=seeds,
+        graph=graph,
+        n_samples=13,
+    )
+
+    edges = graph["edge_index"]
+    edge_type = graph["edge_type"]
+    euclidean_edges = edge_type != 4
+    assert bool(euclidean_edges.any())
+
+    p0 = graph["nodes_uv"][edges[euclidean_edges, 0]]
+    p1 = graph["nodes_uv"][edges[euclidean_edges, 1]]
+    s = torch.linspace(0.0, 1.0, 13, dtype=p0.dtype, device=p0.device).view(1, 13, 1)
+    expected = (1.0 - s) * p0[:, None, :] + s * p1[:, None, :]
+
+    assert curves.shape == (edges.shape[0], 13, 2)
+    assert torch.allclose(curves[euclidean_edges], expected, atol=1e-10, rtol=1e-10)
+
+    curves[euclidean_edges].square().sum().backward()
     assert seeds.grad is not None
     assert torch.isfinite(seeds.grad).all()
     assert torch.linalg.vector_norm(seeds.grad) > 0
@@ -233,7 +259,9 @@ def test_scipy_forward_includes_differentiable_smooth_edge_curves() -> None:
     out = decoder(seeds, topology_mode="scipy", return_xyz=False)
     curves = out["edge_curves_uv"]
 
-    assert curves.shape == (out["graph"]["edge_index"].shape[0], 64, 2)
+    assert curves.shape[0] == out["graph"]["edge_index"].shape[0]
+    assert curves.shape[1] >= decoder.tube_curve_samples
+    assert curves.shape[2] == 2
     curves.square().mean().backward()
     assert seeds.grad is not None
     assert torch.isfinite(seeds.grad).all()
@@ -307,7 +335,7 @@ def test_graph_edge_curve_sampling_dispatches_only_shell_edges_to_box() -> None:
         | torch.isclose(shell[:, 1], torch.ones_like(shell[:, 1]), atol=1e-5)
     )
     assert shell_on_boundary.all()
-    # Type 1 starts inside the box and must remain a Voronoi/Hermite edge.
+    # Type 1 starts inside the box and must remain a straight Voronoi edge.
     first = curves[1, 0]
     first_on_boundary = (
         torch.isclose(first[0], first.new_tensor(0.0))
@@ -382,6 +410,153 @@ def test_soft_tube_field_has_curve_and_radius_gradients() -> None:
     assert torch.isfinite(log_radius.grad).all()
 
 
+def test_width_raw_zero_means_core_curves_only_radius() -> None:
+    decoder = ContinuousVoronoiDecoder(return_xyz=False)
+    seeds = irregular_test_seeds(dtype=torch.float64)
+    w_zero = torch.zeros((seeds.shape[0], seeds.shape[0]), dtype=seeds.dtype)
+    w_large = torch.ones_like(w_zero)
+
+    radius_zero = decoder.width(w_zero, seeds=seeds)
+    radius_large = decoder.width(w_large, seeds=seeds)
+
+    assert torch.allclose(radius_zero, torch.zeros_like(radius_zero))
+    assert torch.all(radius_large > radius_zero)
+
+
+def test_return_xyz_false_keeps_lightweight_edge_curves_xyz_for_plotting() -> None:
+    class PlaneCad:
+        @staticmethod
+        def eval_uv_norm_batch_torch(flat_uv: torch.Tensor) -> dict[str, torch.Tensor]:
+            z = flat_uv.new_zeros((flat_uv.shape[0], 1))
+            return {"xyz": torch.cat((flat_uv, z), dim=1)}
+
+        @staticmethod
+        def smooth_inside_activity(points_uv: torch.Tensor, tau: float=0.01) -> torch.Tensor:
+            return points_uv.new_ones(points_uv.shape[:-1])
+
+        @staticmethod
+        def boundary_parameter(points_uv: torch.Tensor) -> torch.Tensor:
+            u, v = points_uv[:, 0], points_uv[:, 1]
+            bottom = torch.abs(v) <= 1e-4
+            right = ~bottom & (torch.abs(u - 1.0) <= 1e-4)
+            top = ~bottom & ~right & (torch.abs(v - 1.0) <= 1e-4)
+            parameter = torch.empty_like(u)
+            parameter[bottom] = u[bottom]
+            parameter[right] = 1.0 + v[right]
+            parameter[top] = 3.0 - u[top]
+            parameter[~(bottom | right | top)] = 4.0 - v[~(bottom | right | top)]
+            return parameter
+
+    decoder = ContinuousVoronoiDecoder(return_xyz=False)
+    seeds = irregular_test_seeds(dtype=torch.float64).requires_grad_(True)
+    w_raw = torch.zeros((seeds.shape[0], seeds.shape[0]), dtype=seeds.dtype)
+    points_uv = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=seeds.dtype,
+    )
+
+    out = decoder(
+        seeds_raw=seeds,
+        w_raw=w_raw,
+        points_uv=points_uv,
+        cad_domain=PlaneCad(),
+        return_xyz=False,
+    )
+
+    assert "edge_curves_xyz" in out
+    assert "rho" not in out
+    assert out["edge_curves_xyz"].shape[:2] == out["edge_curves_uv"].shape[:2]
+    assert out["edge_curves_xyz"].shape[-1] == 3
+
+    out["edge_curves_xyz"].square().mean().backward()
+    assert seeds.grad is not None and torch.isfinite(seeds.grad).all()
+
+
+def test_return_xyz_true_can_skip_density_fields_for_fast_struts() -> None:
+    class PlaneCad:
+        @staticmethod
+        def eval_uv_norm_batch_torch(flat_uv: torch.Tensor) -> dict[str, torch.Tensor]:
+            z = flat_uv.new_zeros((flat_uv.shape[0], 1))
+            return {"xyz": torch.cat((flat_uv, z), dim=1)}
+
+        @staticmethod
+        def smooth_inside_activity(points_uv: torch.Tensor, tau: float=0.01) -> torch.Tensor:
+            return points_uv.new_ones(points_uv.shape[:-1])
+
+        @staticmethod
+        def boundary_parameter(points_uv: torch.Tensor) -> torch.Tensor:
+            u, v = points_uv[:, 0], points_uv[:, 1]
+            bottom = torch.abs(v) <= 1e-4
+            right = ~bottom & (torch.abs(u - 1.0) <= 1e-4)
+            top = ~bottom & ~right & (torch.abs(v - 1.0) <= 1e-4)
+            parameter = torch.empty_like(u)
+            parameter[bottom] = u[bottom]
+            parameter[right] = 1.0 + v[right]
+            parameter[top] = 3.0 - u[top]
+            parameter[~(bottom | right | top)] = 4.0 - v[~(bottom | right | top)]
+            return parameter
+
+    decoder = ContinuousVoronoiDecoder(return_xyz=False)
+    seeds = irregular_test_seeds(dtype=torch.float64).requires_grad_(True)
+    w_raw = torch.zeros((seeds.shape[0], seeds.shape[0]), dtype=seeds.dtype)
+    points_uv = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=seeds.dtype,
+    )
+
+    out = decoder(
+        seeds_raw=seeds,
+        w_raw=w_raw,
+        points_uv=points_uv,
+        cad_domain=PlaneCad(),
+        return_xyz=True,
+        compute_fields=False,
+    )
+
+    assert "edge_curves_xyz" in out
+    assert "seeds_xyz" in out
+    assert "rho" not in out
+    assert "fiber3d" not in out
+    assert out["edge_curves_xyz"].shape[:2] == out["edge_curves_uv"].shape[:2]
+    assert out["edge_curves_xyz"].shape[-1] == 3
+
+    (out["edge_curves_xyz"].square().mean() + out["seeds_xyz"].square().mean()).backward()
+    assert seeds.grad is not None and torch.isfinite(seeds.grad).all()
+
+
+def test_constructor_face_mesh_supplies_evaluation_tensors() -> None:
+    dtype = torch.float64
+    face_mesh = {
+        "uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]],
+            dtype=dtype,
+        ),
+        "points_xyz": torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.5, 0.5, 0.0]],
+            dtype=dtype,
+        ),
+        "Xu": torch.tensor([[1.0, 0.0, 0.0]], dtype=dtype).expand(5, 3),
+        "Xv": torch.tensor([[0.0, 1.0, 0.0]], dtype=dtype).expand(5, 3),
+        "faces_ijk": torch.tensor([[0, 1, 4], [1, 3, 4], [3, 2, 4], [2, 0, 4]], dtype=torch.long),
+        "BBX": {"xmin": 0.0, "xmax": 1.0},
+    }
+    decoder = ContinuousVoronoiDecoder(face_mesh=face_mesh, return_xyz=False)
+    seeds = irregular_test_seeds(dtype=dtype)
+    w_raw = torch.zeros((seeds.shape[0], seeds.shape[0]), dtype=dtype)
+
+    out = decoder(seeds_raw=seeds, w_raw=w_raw)
+
+    assert decoder.point_Xyz.shape == (5, 3)
+    assert decoder.point_UV.shape == (5, 2)
+    assert decoder.Xu.shape == (5, 3)
+    assert decoder.Xv.shape == (5, 3)
+    assert decoder.XV.shape == (5, 3)
+    assert decoder.faces_ijk.shape == (4, 3)
+    assert decoder.mesh_info["BBX"]["xmax"] == 1.0
+    assert out["rho"].shape == (5,)
+    assert torch.allclose(out["centerline_radius"], torch.zeros_like(out["centerline_radius"]))
+
+
 def test_curve_points_and_tangents_xyz_uses_finite_differences() -> None:
     decoder = ContinuousVoronoiDecoder(return_xyz=False)
     curves = torch.tensor(
@@ -441,6 +616,36 @@ def test_soft_tube_fem_fields_have_valid_angles_and_gradients() -> None:
     loss.backward()
     assert curves.grad is not None and torch.isfinite(curves.grad).all()
     assert log_radius.grad is not None and torch.isfinite(log_radius.grad).all()
+
+
+def test_soft_tube_fem_fields_stream_cdist_chunks() -> None:
+    decoder = ContinuousVoronoiDecoder(return_xyz=False, tube_cdist_max_values=6)
+    elem_centers = torch.tensor(
+        [[0.0, 0.2, 0.0], [0.5, 0.1, 0.0], [1.0, 0.2, 0.0], [1.5, 0.1, 0.0]],
+        dtype=torch.float64,
+    )
+    curves = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [1.5, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+    fields = decoder.soft_tube_density_and_fiber_to_elements(
+        elem_centers_xyz=elem_centers,
+        curves_xyz=curves,
+        radius=0.15,
+        tau_distance=0.02,
+        tau_density=0.02,
+        tau_fiber=0.02,
+        rho_min=1e-3,
+    )
+    curve_points, _ = decoder.curve_points_and_tangents_xyz(curves)
+    expected_distance = torch.cdist(elem_centers, curve_points).min(dim=1).values
+
+    assert torch.allclose(fields["distance"], expected_distance)
+    assert torch.isfinite(fields["density"]).all()
+    assert torch.isfinite(fields["fiber"]).all()
 
 
 if __name__ == "__main__":

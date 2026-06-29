@@ -1,44 +1,27 @@
 import torch
 import torch.nn as nn
 
-from .anisotropy_predictor import AnisotropyPredictor
-from .boundary_predictor import BoundaryPredictor
-from .height_predictor import HeightPredictor
 from .seed_identity import SeedIdentityEmbedding
 from .seed_refiner import SeedRefiner
-from .tau_predictor import TauPredictor
 from .utils import check_finite
 from .width_predictor import WidthPredictor
 
 
 class PPNet(nn.Module):
     """
-    PPNet predicts the full VoronoiDecoder control dictionary.
+    PPNet predicts only the parameters used by the current centerline decoder.
 
-    The model uses a learned latent vector, then small specialized heads for
-    seeds, pair widths, height, anisotropy, boundary parameters, and tau.
+    It refines seed UV locations and exposes one trainable global raw strut
+    width expanded to the legacy ``w_raw`` matrix shape.
     """
 
     def __init__(
         self,
         n_seeds,
         hidden=256,
-
-        # feature toggles
-        use_Metric_anisotropy=False,
-        predict_height=False,
-        predict_boundary_params=False,
-        predict_tau=False,
-        tau_pred_start=0.02,
-        tau_pred_min=1e-4,
-        tau_pred_max=0.2,
-
-        # width behavior
         freeze_w=False,
         w_const=0.25,
         w_head_bias_init=0.0,
-
-        # seed update constraints
         eps_uv=1e-4,
         max_delta_logit=0.30,
         max_step_uv=0.08,
@@ -47,21 +30,12 @@ class PPNet(nn.Module):
         independent_seed_offset_max=0.05,
         allow_seed_outside_domain=False,
         seed_domain_margin=0.25,
-
-        # safety
         enable_checks=True,
+        **unused_kwargs,
     ):
         super().__init__()
 
         self.n_seeds = n_seeds
-        self.use_Metric_anisotropy = use_Metric_anisotropy
-        self.predict_height = predict_height
-        self.predict_boundary_params = predict_boundary_params
-        self.predict_tau = predict_tau
-        self.tau_pred_start = float(tau_pred_start)
-        self.tau_pred_min = float(tau_pred_min)
-        self.tau_pred_max = float(tau_pred_max)
-
         self.freeze_w = freeze_w
         self.w_const = w_const
 
@@ -101,29 +75,6 @@ class PPNet(nn.Module):
             w_head_bias_init=w_head_bias_init,
             enable_checks=self.enable_checks,
         )
-        self.height_predictor = HeightPredictor(
-            hidden=hidden,
-            predict_height=self.predict_height,
-            enable_checks=self.enable_checks,
-        )
-        self.anisotropy_predictor = AnisotropyPredictor(
-            hidden=hidden,
-            use_Metric_anisotropy=self.use_Metric_anisotropy,
-            enable_checks=self.enable_checks,
-        )
-        self.boundary_predictor = BoundaryPredictor(
-            hidden=hidden,
-            predict_boundary_params=self.predict_boundary_params,
-            enable_checks=self.enable_checks,
-        )
-        self.tau_predictor = TauPredictor(
-            hidden=hidden,
-            predict_tau=self.predict_tau,
-            tau_pred_start=self.tau_pred_start,
-            tau_pred_min=self.tau_pred_min,
-            tau_pred_max=self.tau_pred_max,
-            enable_checks=self.enable_checks,
-        )
 
     # Compatibility properties for existing training code.
     @property
@@ -149,31 +100,31 @@ class PPNet(nn.Module):
 
     @property
     def h_head(self):
-        return self.height_predictor.h_head
+        return None
 
     @property
     def theta_head(self):
-        return self.anisotropy_predictor.theta_head
+        return None
 
     @property
     def a_head(self):
-        return self.anisotropy_predictor.a_head
+        return None
 
     @property
     def boundary_width_head(self):
-        return self.boundary_predictor.boundary_width_head
+        return None
 
     @property
     def boundary_alpha_head(self):
-        return self.boundary_predictor.boundary_alpha_head
+        return None
 
     @property
     def boundary_beta_head(self):
-        return self.boundary_predictor.boundary_beta_head
+        return None
 
     @property
     def tau_head(self):
-        return self.tau_predictor.tau_head
+        return None
 
     def _check(self, tensor, name):
         check_finite(tensor, name, self.enable_checks)
@@ -230,25 +181,11 @@ class PPNet(nn.Module):
         )
         seeds_uv = self._apply_independent_seed_offsets(seeds_uv)
 
-        # h -> seed-level/pairwise predictors
         self.width_predictor.freeze_w = self.freeze_w
         self.width_predictor.w_const = self.w_const
         w_raw = self.width_predictor(h, n_seeds, z)
-        theta, a_raw = self.anisotropy_predictor(h)
-
-        # z -> global predictors
-        h_raw = self.height_predictor(z)
-        boundary_width_raw, boundary_alpha_raw, boundary_beta_raw = self.boundary_predictor(z)
-        tau = self.tau_predictor(z)
 
         return {
             "seeds_raw": seeds_uv,
             "w_raw": w_raw,
-            "h_raw": h_raw,
-            "theta": theta,
-            "a_raw": a_raw,
-            "boundary_width_raw": boundary_width_raw,
-            "boundary_alpha_raw": boundary_alpha_raw,
-            "boundary_beta_raw": boundary_beta_raw,
-            "tau": tau,
         }
