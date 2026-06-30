@@ -11,7 +11,7 @@ from scipy.spatial import Delaunay, Voronoi, voronoi_plot_2d, cKDTree
 class ContinuousVoronoiDecoder(nn.Module):
     """Differentiable UV Voronoi decoder using SciPy topology and Torch geometry."""
 
-    def __init__(self, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True, return_xyz: bool=True, vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_merge_sigma: float=1e-4, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, boundary_snap_tol: float=1e-5, **unused_kwargs: Any):
+    def __init__(self, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True, return_xyz: bool=True, vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_merge_sigma: float=1e-4, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, **unused_kwargs: Any):
         super().__init__()
         self.eps = float(eps)
         self.solve_reg = float(solve_reg)
@@ -50,7 +50,6 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.duplicate_effect_temp_ratio = float(duplicate_effect_temp_ratio)
         self.seed_domain_mask_threshold = float(seed_domain_mask_threshold)
         self.min_active_seeds = int(min_active_seeds)
-        self.boundary_snap_tol = float(boundary_snap_tol)
 
     @staticmethod
     def _bool_value(value: Any) -> bool:
@@ -1012,60 +1011,8 @@ class ContinuousVoronoiDecoder(nn.Module):
         hit = torch.where(valid, hit_candidate, origin)
         return (hit, ts[index], valid)
 
-    def snap_near_box_boundary_uv(
-        self,
-        p: torch.Tensor,
-        tol: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        If p is within tol of the UV box boundary [0,1]^2, snap it to the nearest
-        boundary side.
-
-        Returns:
-            snapped: [2] tensor
-            did_snap: bool tensor scalar
-        """
-        if p.shape != (2,):
-            raise ValueError('p must have shape [2].')
-        tol_t = torch.as_tensor(
-            self.boundary_snap_tol if tol is None else float(tol),
-            dtype=p.dtype,
-            device=p.device,
-        )
-        zero = p.new_tensor(0.0)
-        one = p.new_tensor(1.0)
-
-        dists = torch.stack([
-            torch.abs(p[0] - zero),
-            torch.abs(p[0] - one),
-            torch.abs(p[1] - zero),
-            torch.abs(p[1] - one),
-        ])
-        side = torch.argmin(dists)
-        did_snap = dists[side] <= tol_t
-
-        p_clamped = p.clamp(0.0, 1.0)
-        left = torch.stack((zero, p_clamped[1]))
-        right = torch.stack((one, p_clamped[1]))
-        bottom = torch.stack((p_clamped[0], zero))
-        top = torch.stack((p_clamped[0], one))
-        candidates = torch.stack((left, right, bottom, top), dim=0)
-        snapped_candidate = candidates[side]
-        snapped = torch.where(did_snap, snapped_candidate, p)
-        return snapped, did_snap
-
     def choose_valid_boundary_ray_direction(self, origin: torch.Tensor, seed_i: torch.Tensor, seed_j: torch.Tensor, cad_domain: Any | None=None, u_periodic: bool=False, v_periodic: bool=False, all_seeds: torch.Tensor | None=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Validate both perpendicular directions and return the shortest valid hit."""
-        snapped_origin, did_snap = self.snap_near_box_boundary_uv(origin)
-        if bool(did_snap.detach().cpu().item()):
-            direction = snapped_origin - origin
-            norm = torch.linalg.vector_norm(direction)
-            if bool((norm <= self.eps).detach().cpu().item()):
-                direction = origin.new_zeros((2,))
-            else:
-                direction = direction / norm.clamp_min(self.eps)
-            return (direction, snapped_origin, origin.new_tensor(0.0))
-
         tangent = self.periodic_difference(seed_j, seed_i, u_periodic, v_periodic)
         normal = torch.stack((-tangent[1], tangent[0]))
         normal = normal / torch.sqrt((normal * normal).sum() + self.eps)
@@ -1113,7 +1060,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         empty_float_2 = lambda: torch.empty((0, 2), dtype=dtype, device=device)
 
         def empty_topology() -> dict[str, Any]:
-            return {'triples': empty_long_3(), 'vertex_type': torch.empty((0,), dtype=torch.long, device=device), 'vertex_seed_triples': empty_long_3(), 'boundary_origin_vertex': torch.empty((0,), dtype=torch.long, device=device), 'boundary_target_vertex': torch.empty((0,), dtype=torch.long, device=device), 'boundary_seed_pair': empty_long_2(), 'boundary_ray_dir': empty_float_2(), 'boundary_source_type': torch.empty((0,), dtype=torch.long, device=device), 'edges': empty_long_2(), 'edge_seed_pairs': empty_long_2(), 'edge_type': torch.empty((0,), dtype=torch.long, device=device), 'boundary_rays': empty_long_3(), 'boundary_ray_dirs': empty_float_2(), 'scipy_vertices_np': np.empty((0, 2), dtype=points_np.dtype), 'isolated_vertices': torch.empty((0,), dtype=torch.long, device=device), 'delaunay_triples_np': np.empty((0, 3), dtype=np.int64), 'diagnostics': {'num_finite_edges_inside': 0, 'num_finite_edges_clipped_once': 0, 'num_finite_edges_clipped_twice': 0, 'num_infinite_rays_clipped': 0, 'num_boundary_snapped_rays': 0, 'num_discarded_rays': 0, 'num_raw_scipy_vertices': 0, 'num_raw_boundary_vertices': 0, 'num_pruned_vertices': 0, 'num_final_vertices': 0, 'num_final_interior_vertices': 0, 'num_final_boundary_vertices': 0}}
+            return {'triples': empty_long_3(), 'vertex_type': torch.empty((0,), dtype=torch.long, device=device), 'vertex_seed_triples': empty_long_3(), 'boundary_origin_vertex': torch.empty((0,), dtype=torch.long, device=device), 'boundary_target_vertex': torch.empty((0,), dtype=torch.long, device=device), 'boundary_seed_pair': empty_long_2(), 'boundary_ray_dir': empty_float_2(), 'boundary_source_type': torch.empty((0,), dtype=torch.long, device=device), 'edges': empty_long_2(), 'edge_seed_pairs': empty_long_2(), 'edge_type': torch.empty((0,), dtype=torch.long, device=device), 'boundary_rays': empty_long_3(), 'boundary_ray_dirs': empty_float_2(), 'scipy_vertices_np': np.empty((0, 2), dtype=points_np.dtype), 'isolated_vertices': torch.empty((0,), dtype=torch.long, device=device), 'delaunay_triples_np': np.empty((0, 3), dtype=np.int64), 'diagnostics': {'num_finite_edges_inside': 0, 'num_finite_edges_clipped_once': 0, 'num_finite_edges_clipped_twice': 0, 'num_infinite_rays_clipped': 0, 'num_discarded_rays': 0, 'num_raw_scipy_vertices': 0, 'num_raw_boundary_vertices': 0, 'num_pruned_vertices': 0, 'num_final_vertices': 0, 'num_final_interior_vertices': 0, 'num_final_boundary_vertices': 0}}
         if points_np.shape[0] < 3:
             return empty_topology()
         try:
@@ -1147,7 +1094,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         edge_types: list[int] = []
         boundary_rays: list[list[int]] = []
         boundary_ray_dirs: list[list[float]] = []
-        diagnostics = {'num_finite_edges_inside': 0, 'num_finite_edges_clipped_once': 0, 'num_finite_edges_clipped_twice': 0, 'num_infinite_rays_clipped': 0, 'num_boundary_snapped_rays': 0, 'num_discarded_rays': 0, 'num_raw_scipy_vertices': num_raw_scipy_vertices}
+        diagnostics = {'num_finite_edges_inside': 0, 'num_finite_edges_clipped_once': 0, 'num_finite_edges_clipped_twice': 0, 'num_infinite_rays_clipped': 0, 'num_discarded_rays': 0, 'num_raw_scipy_vertices': num_raw_scipy_vertices}
 
         def add_boundary_vertex(origin_vertex: int, target_vertex: int, seed_i: int, seed_j: int, direction: np.ndarray, source_type: int) -> int:
             boundary_id = len(vertex_type)
@@ -1159,9 +1106,6 @@ class ContinuousVoronoiDecoder(nn.Module):
             boundary_ray_dir.append([float(direction[0]), float(direction[1])])
             boundary_source_type.append(source_type)
             return boundary_id
-
-        # Graph edges must come from Voronoi ridges. Delaunay simplices are
-        # exposed only as diagnostics and must not add simplex-adjacency edges.
         for seed_pair, ridge_vertices in zip(vor.ridge_points, vor.ridge_vertices):
             finite_vertices = [int(v) for v in ridge_vertices if int(v) >= 0]
             seed_i = int(seed_pair[0])
@@ -1205,13 +1149,9 @@ class ContinuousVoronoiDecoder(nn.Module):
                 if selected is None:
                     diagnostics['num_discarded_rays'] += 1
                     continue
-                direction_t, _, ray_t = selected
-                source_type = 1
-                if bool((ray_t <= self.eps).detach().cpu().item()):
-                    diagnostics['num_boundary_snapped_rays'] += 1
-                    source_type = 5
+                direction_t, _, _ = selected
                 direction = direction_t.detach().cpu().numpy()
-                boundary_id = add_boundary_vertex(finite_v, -1, seed_i, seed_j, direction, source_type)
+                boundary_id = add_boundary_vertex(finite_v, -1, seed_i, seed_j, direction, 1)
                 edges.append([finite_v, boundary_id])
                 edge_seed_pairs.append([seed_i, seed_j])
                 edge_types.append(1)
@@ -1311,10 +1251,6 @@ class ContinuousVoronoiDecoder(nn.Module):
                     continue
                 direction = node_values[target_id] - node_values[origin_id]
                 direction = direction / torch.sqrt((direction * direction).sum() + self.eps)
-            elif source_type == 5:
-                snapped, _ = self.snap_near_box_boundary_uv(node_values[origin_id])
-                node_values[boundary_id] = snapped
-                continue
             elif 0 <= i < seeds_uv.shape[0] and 0 <= j < seeds_uv.shape[0]:
                 tangent = self.periodic_difference(seeds_uv[j], seeds_uv[i], u_periodic, v_periodic)
                 direction = torch.stack((-tangent[1], tangent[0]))
@@ -1672,7 +1608,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         active_interior = topo['vertex_type'] == 0
         num_interior = int(active_interior.sum().item())
         num_boundary = int((topo['vertex_type'] == 1).sum().item())
-        graph = {'nodes_uv': vertices_uv, 'node_alpha': alpha, 'node_type': topo['vertex_type'], 'node_degree': vertex_degree, 'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_alpha': edge_alpha, 'edge_type': edge_type, 'vertex_degree': vertex_degree, 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': [{0: 'interior', 1: 'infinite_ray_clipping', 2: 'finite_edge_clipping', 3: 'pair_bisector_boundary', 4: 'corner_shell', 5: 'snapped_infinite_ray'}.get(int(value), 'unknown') for value in topo['boundary_source_type'].detach().cpu().tolist()], 'diagnostics': topo['diagnostics'], 'num_interior_nodes': num_interior, 'num_boundary_nodes': num_boundary}
+        graph = {'nodes_uv': vertices_uv, 'node_alpha': alpha, 'node_type': topo['vertex_type'], 'node_degree': vertex_degree, 'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_alpha': edge_alpha, 'edge_type': edge_type, 'vertex_degree': vertex_degree, 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': [{0: 'interior', 1: 'infinite_ray_clipping', 2: 'finite_edge_clipping', 3: 'pair_bisector_boundary', 4: 'corner_shell'}.get(int(value), 'unknown') for value in topo['boundary_source_type'].detach().cpu().tolist()], 'diagnostics': topo['diagnostics'], 'num_interior_nodes': num_interior, 'num_boundary_nodes': num_boundary}
         if 'edge_seed_pair' in graph:
             local_pairs = graph['edge_seed_pair']
             valid_pair_mask = local_pairs >= 0
@@ -1927,6 +1863,7 @@ class ContinuousVoronoiDecoder(nn.Module):
     def plot_generated_graph_debug(self, seeds_uv, out=None, cad_domain=None, show_node_ids: bool=True, show_edge_ids: bool=False, node_id_fontsize: int=9, print_node_table: bool=True, show_pruned_nodes: bool=False, color_by_edge_type: bool=True):
         """Plot the generated graph abstraction without a SciPy background."""
         return self.plot_graph_output(seeds_uv=seeds_uv, out=out, cad_domain=cad_domain, show_node_ids=show_node_ids, show_edge_ids=show_edge_ids, node_id_fontsize=node_id_fontsize, print_node_table=print_node_table, show_pruned_nodes=show_pruned_nodes, color_by_edge_type=color_by_edge_type)
+
     def plot_scipy_vs_generated_graph(
         self,
         seeds_uv,
@@ -1942,33 +1879,32 @@ class ContinuousVoronoiDecoder(nn.Module):
         if out is None:
             out = self(seeds_uv, cad_domain=cad_domain, return_xyz=False)
 
+        # Original seeds are always shown.
         original_seeds_uv = seeds_uv
+
+        # These are the seeds actually used to build SciPy topology.
         topology_seeds_uv = out.get("topology_seeds_uv", original_seeds_uv)
 
-        original_np = original_seeds_uv.detach().cpu().numpy()
-        topology_np = topology_seeds_uv.detach().cpu().numpy()
-
-        # Robust active mask over original seeds.
+        # Active mask over original seeds.
         if "seed_active_mask" in out:
-            active_mask = out["seed_active_mask"].detach().cpu().numpy().astype(bool)
+            active_mask = out["seed_active_mask"].to(
+                device=original_seeds_uv.device,
+                dtype=torch.bool,
+            )
         else:
-            active_mask = np.ones((original_np.shape[0],), dtype=bool)
+            active_mask = torch.ones(
+                (original_seeds_uv.shape[0],),
+                dtype=torch.bool,
+                device=original_seeds_uv.device,
+            )
 
-        # If mask is not aligned with original seeds, rebuild it from active_seed_ids.
-        if active_mask.shape[0] != original_np.shape[0]:
-            active_mask = np.zeros((original_np.shape[0],), dtype=bool)
-            if "active_seed_ids" in out:
-                active_ids = out["active_seed_ids"].detach().cpu().numpy().astype(int)
-                active_ids = active_ids[(active_ids >= 0) & (active_ids < original_np.shape[0])]
-                active_mask[active_ids] = True
-            else:
-                # Fallback: match topology seeds to original seeds by coordinate.
-                for p in topology_np:
-                    d = np.linalg.norm(original_np - p[None, :], axis=1)
-                    active_mask[np.argmin(d)] = True
+        original_np = original_seeds_uv.detach().cpu().numpy()
+        active_mask_np = active_mask.detach().cpu().numpy()
 
-        active_np = original_np[active_mask]
-        inactive_np = original_np[~active_mask]
+        active_np = original_np[active_mask_np]
+        inactive_np = original_np[~active_mask_np]
+
+        topology_np = topology_seeds_uv.detach().cpu().numpy()
 
         fig, axes = plt.subplots(
             1,
@@ -1980,35 +1916,26 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         # Left: raw SciPy Voronoi from active/topology seeds only.
         try:
-            if topology_np.shape[0] >= 3:
-                raw_voronoi = Voronoi(topology_np)
-                voronoi_plot_2d(
-                    raw_voronoi,
-                    ax=left,
-                    show_vertices=False,
-                    show_points=False,
-                    line_colors="black",
-                    line_width=1.0,
-                    line_alpha=0.75,
-                    point_size=0,
-                )
-                if raw_voronoi.vertices.size > 0:
-                    left.scatter(
-                        raw_voronoi.vertices[:, 0],
-                        raw_voronoi.vertices[:, 1],
-                        marker="x",
-                        c="0.35",
-                        s=55,
-                        label="Raw SciPy vertices",
-                        zorder=3,
-                    )
-            else:
-                left.text(
-                    0.5,
-                    0.5,
-                    f"SciPy Voronoi unavailable\nonly {topology_np.shape[0]} active seeds",
-                    ha="center",
-                    va="center",
+            raw_voronoi = Voronoi(topology_np)
+            voronoi_plot_2d(
+                raw_voronoi,
+                ax=left,
+                show_vertices=False,
+                show_points=False,
+                line_colors="black",
+                line_width=1.0,
+                line_alpha=0.75,
+                point_size=0,
+            )
+            if raw_voronoi.vertices.size > 0:
+                left.scatter(
+                    raw_voronoi.vertices[:, 0],
+                    raw_voronoi.vertices[:, 1],
+                    marker="x",
+                    c="0.35",
+                    s=55,
+                    label="Raw SciPy vertices",
+                    zorder=3,
                 )
         except Exception as error:
             left.text(
@@ -2019,17 +1946,15 @@ class ContinuousVoronoiDecoder(nn.Module):
                 va="center",
             )
 
-        # Show all original seeds on left.
+        # Show all original seeds, colored by activation.
         if active_np.shape[0] > 0:
             left.scatter(
                 active_np[:, 0],
                 active_np[:, 1],
                 c="green",
-                s=60,
-                edgecolors="black",
-                linewidths=0.6,
+                s=55,
                 label="Active seeds",
-                zorder=6,
+                zorder=5,
             )
 
         if inactive_np.shape[0] > 0:
@@ -2037,19 +1962,17 @@ class ContinuousVoronoiDecoder(nn.Module):
                 inactive_np[:, 0],
                 inactive_np[:, 1],
                 c="red",
-                s=70,
-                marker="x",
-                linewidths=2.0,
+                s=55,
                 label="Inactive seeds",
-                zorder=7,
+                zorder=5,
             )
 
         left.set_xlim(0, 1)
         left.set_ylim(0, 1)
         left.set_aspect("equal")
         left.set_title(
-            f"VD for {original_np.shape[0]} seeds "
-            f"({topology_np.shape[0]} active)\n"
+            f"VD for {original_seeds_uv.shape[0]} seeds "
+            f"({topology_seeds_uv.shape[0]} active)\n"
             "Raw SciPy Voronoi from active seeds"
         )
         left.legend()
@@ -2066,34 +1989,27 @@ class ContinuousVoronoiDecoder(nn.Module):
             color_by_edge_type,
         )
 
-        # Overlay all original seeds on right.
-        if active_np.shape[0] > 0:
-            middle.scatter(
-                active_np[:, 0],
-                active_np[:, 1],
-                c="green",
-                s=50,
-                edgecolors="black",
-                linewidths=0.6,
-                label="Active seeds",
-                zorder=8,
-            )
-
+        # Overlay original inactive seeds on generated graph too.
         if inactive_np.shape[0] > 0:
             middle.scatter(
                 inactive_np[:, 0],
                 inactive_np[:, 1],
                 c="red",
-                s=70,
-                marker="x",
-                linewidths=2.0,
+                s=55,
                 label="Inactive seeds",
-                zorder=9,
+                zorder=8,
             )
 
-        middle.set_xlim(0, 1)
-        middle.set_ylim(0, 1)
-        middle.set_aspect("equal")
+        if active_np.shape[0] > 0:
+            middle.scatter(
+                active_np[:, 0],
+                active_np[:, 1],
+                c="green",
+                s=45,
+                label="Active seeds",
+                zorder=7,
+            )
+
         middle.set_facecolor("none")
         middle.patch.set_alpha(0.0)
 
