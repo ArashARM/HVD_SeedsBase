@@ -20,7 +20,7 @@ collapse_min_seed_dist_factor: 2
 comp_normalize_by: None
 debug_anomaly_detection: False
 decoder_raw_temp: 1.25
-early_stop_start: 0.3
+early_stop_start: 0.8
 effective_volume_power: 2.0
 eps: 1e-12
 experiment_name: FreeSharp1_New_1000
@@ -34,9 +34,9 @@ freeze_w: True
 grad_clip_norm: 1.0
 guard_seed_anchor_updates: False
 independent_seed_offset_max: 0.05
-lam_bnd: 0
+lam_bnd: 500
 lam_fem: 200.0
-lam_rep: 0
+lam_rep: 500
 lam_vol: 1.0
 lam_vol_effective: 0.5
 log_every: 100
@@ -49,7 +49,7 @@ min_active_seeds: None
 min_delta: 0.0001
 min_feature_size_3d: None
 normalize_losses: False
-num_steps: 1000
+num_steps: 500
 patience: 300
 project_seed_spacing_each_step: False
 prune_inactive_on_plateau: False
@@ -66,7 +66,7 @@ seed_domain_mask_support_scale: 2.5
 seed_domain_mask_threshold: 0.5
 seed_domain_temp: 0.05
 seed_init_fps_seed: None
-seed_number: 15
+seed_number: 10
 seed_offset_scale_final: 0.25
 seed_offset_scale_ramp_frac: 1.0
 seed_offset_scale_start: 0.5
@@ -94,7 +94,7 @@ use_rolling_seed_anchors: True
 use_seed_domain_mask: True
 visualize_filtered_density: True
 visualize_raw_density: False
-w_const: -2
+w_const: 0.1
 w_head_bias_init: None
 w_max_ratio: 0.5
 w_min: 0.005

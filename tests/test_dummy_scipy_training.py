@@ -414,12 +414,15 @@ def test_width_raw_zero_means_core_curves_only_radius() -> None:
     decoder = ContinuousVoronoiDecoder(return_xyz=False)
     seeds = irregular_test_seeds(dtype=torch.float64)
     w_zero = torch.zeros((seeds.shape[0], seeds.shape[0]), dtype=seeds.dtype)
+    w_negative = -torch.ones_like(w_zero)
     w_large = torch.ones_like(w_zero)
 
     radius_zero = decoder.width(w_zero, seeds=seeds)
+    radius_negative = decoder.width(w_negative, seeds=seeds)
     radius_large = decoder.width(w_large, seeds=seeds)
 
     assert torch.allclose(radius_zero, torch.zeros_like(radius_zero))
+    assert torch.allclose(radius_negative, torch.zeros_like(radius_negative))
     assert torch.all(radius_large > radius_zero)
 
 
