@@ -9,10 +9,20 @@ from matplotlib.lines import Line2D
 from scipy.spatial import Delaunay, Voronoi, voronoi_plot_2d, cKDTree
 
 class ContinuousVoronoiDecoder(nn.Module):
-    """Differentiable UV Voronoi decoder using SciPy topology and Torch geometry."""
+    """
+    Differentiable UV Voronoi decoder using one topology philosophy:
 
-    def __init__(self, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True, return_xyz: bool=True, vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_merge_sigma: float=1e-4, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, **unused_kwargs: Any):
+    SciPy/Qhull builds discrete topology from real seeds plus fixed guard seeds.
+    Guard-related ridges are discarded, and real-real ridges are represented as
+    finite segments clipped to the UV box or CAD trim curves. PyTorch then
+    reconstructs those finite clipped segments differentiably. No infinite-ray
+    boundary reconstruction is used.
+    """
+
+    def __init__(self,Cad_domain: any, face_mesh: torch.Tensor, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True, return_xyz: bool=True, vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_lift_max_values: int=4000000, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_merge_sigma: float=1e-4, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, **unused_kwargs: Any):
         super().__init__()
+        self.Cad_domain = Cad_domain
+        self.face_mesh = face_mesh
         self.eps = float(eps)
         self.solve_reg = float(solve_reg)
         self.tau_voronoi = float(tau_voronoi)
@@ -34,6 +44,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.centerline_beta = self.beta if centerline_beta is None else float(centerline_beta)
         self.tube_curve_samples = int(tube_curve_samples)
         self.tube_lift_tau = float(tube_lift_tau)
+        self.tube_lift_max_values = max(1, int(tube_lift_max_values))
         self.tube_distance_tau = self.centerline_softmin_tau if tube_distance_tau is None else float(tube_distance_tau)
         self.tube_density_tau = self.centerline_beta if tube_density_tau is None else float(tube_density_tau)
         self.tube_fiber_tau = self.tube_distance_tau if tube_fiber_tau is None else float(tube_fiber_tau)
@@ -50,6 +61,18 @@ class ContinuousVoronoiDecoder(nn.Module):
         self.duplicate_effect_temp_ratio = float(duplicate_effect_temp_ratio)
         self.seed_domain_mask_threshold = float(seed_domain_mask_threshold)
         self.min_active_seeds = int(min_active_seeds)
+        self.use_guard_seeds = bool(unused_kwargs.pop("use_guard_seeds", True))
+        self.guard_seed_margin = float(unused_kwargs.pop("guard_seed_margin", 1.0))
+        self.guard_seed_per_side = int(unused_kwargs.pop("guard_seed_per_side", 5))
+        self.guard_seed_max_attempts = int(unused_kwargs.pop("guard_seed_max_attempts", 4))
+        self.guard_seed_expand_factor = float(unused_kwargs.pop("guard_seed_expand_factor", 2.0))
+        self.strict_guard_topology = bool(unused_kwargs.pop("strict_guard_topology", False))
+        self.clip_tol = float(unused_kwargs.pop("clip_tol", 1e-10))
+        self.node_merge_tol = float(unused_kwargs.pop("node_merge_tol", 1e-8))
+        self.points_uv = face_mesh["uv"]
+        self.Xu = face_mesh["Xu"]
+        self.Xv = face_mesh["Xv"]
+        self.points_3d = face_mesh["points_xyz"]
 
     @staticmethod
     def _bool_value(value: Any) -> bool:
@@ -315,8 +338,12 @@ class ContinuousVoronoiDecoder(nn.Module):
                     3 = boundary-to-boundary clipped Voronoi edge
                     4 = boundary shell / UV box loop edge
 
-                Only type 4 follows the UV-box boundary. Types 0, 1, and 3 are
-                differentiable straight Voronoi edge segments.
+                Type 4 follows CAD boundary polylines when they are available,
+                otherwise it falls back to the UV-box boundary. Types 0, 1, and
+                3 are differentiable straight Voronoi edge segments.
+
+                Shell edges are retained because CAD/box boundary-loop sampling
+                consumes them directly when building tube centerline curves.
                 """
         nodes_uv = graph['nodes_uv']
         edge_index = graph['edge_index']
@@ -335,10 +362,118 @@ class ContinuousVoronoiDecoder(nn.Module):
         for edge_id in range(edge_index.shape[0]):
             if edge_id in shell_id_set:
                 a, b = edge_index[edge_id]
-                result_curves.append(self.sample_boundary_box_edge_uv(nodes_uv[a], nodes_uv[b], n_samples=n_samples))
+                cad_curve = self.sample_cad_boundary_edge_uv(
+                    nodes_uv[a],
+                    nodes_uv[b],
+                    graph=graph,
+                    n_samples=n_samples,
+                )
+                if cad_curve is None:
+                    cad_curve = self.sample_boundary_box_edge_uv(nodes_uv[a], nodes_uv[b], n_samples=n_samples)
+                result_curves.append(cad_curve)
             else:
                 result_curves.append(curves[edge_id])
         return torch.stack(result_curves, dim=0)
+
+    def sample_cad_boundary_edge_uv(self, p0: torch.Tensor, p1: torch.Tensor, graph: dict[str, torch.Tensor], n_samples: int) -> torch.Tensor | None:
+        """Sample a shell edge along packed CAD boundary polylines."""
+        boundary_uv = graph.get('boundary_curve_uv')
+        offsets = graph.get('boundary_curve_offsets')
+        loop_id = graph.get('boundary_curve_loop_id')
+        if boundary_uv is None or offsets is None:
+            return None
+        boundary_uv = torch.as_tensor(boundary_uv, dtype=p0.dtype, device=p0.device).reshape(-1, 2)
+        offsets = torch.as_tensor(offsets, dtype=torch.long, device=p0.device).reshape(-1)
+        if boundary_uv.numel() == 0 or offsets.numel() < 2:
+            return None
+        if loop_id is None:
+            loop_id = torch.arange(offsets.numel() - 1, dtype=torch.long, device=p0.device)
+        else:
+            loop_id = torch.as_tensor(loop_id, dtype=torch.long, device=p0.device).reshape(-1)
+        if loop_id.numel() != offsets.numel() - 1:
+            return None
+
+        p0_np = p0.detach().cpu().numpy()
+        p1_np = p1.detach().cpu().numpy()
+        uv_np = boundary_uv.detach().cpu().numpy()
+        offsets_np = offsets.detach().cpu().numpy()
+        loop_np = loop_id.detach().cpu().numpy()
+
+        def project_point_to_polyline(point: np.ndarray, polyline: np.ndarray) -> tuple[float, float, np.ndarray]:
+            starts = polyline[:-1]
+            ends = polyline[1:]
+            deltas = ends - starts
+            lengths2 = np.sum(deltas * deltas, axis=1)
+            valid = lengths2 > 1e-16
+            if not np.any(valid):
+                return (float('inf'), 0.0, polyline[0])
+            starts_v = starts[valid]
+            deltas_v = deltas[valid]
+            lengths2_v = lengths2[valid]
+            rel = point[None, :] - starts_v
+            local_t = np.clip(np.sum(rel * deltas_v, axis=1) / lengths2_v, 0.0, 1.0)
+            proj = starts_v + local_t[:, None] * deltas_v
+            d2 = np.sum((proj - point[None, :]) ** 2, axis=1)
+            best = int(np.argmin(d2))
+            valid_ids = np.nonzero(valid)[0]
+            seg_id = int(valid_ids[best])
+            lengths = np.linalg.norm(deltas, axis=1)
+            cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+            s = float(cumulative[seg_id] + local_t[best] * lengths[seg_id])
+            return (float(d2[best]), s, proj[best])
+
+        best = None
+        for loop_value in sorted(set(int(v) for v in loop_np.tolist())):
+            piece_ids = np.nonzero(loop_np == loop_value)[0]
+            if piece_ids.size == 0:
+                continue
+            parts = []
+            for local_id, piece_id in enumerate(piece_ids.tolist()):
+                start = int(offsets_np[piece_id])
+                end = int(offsets_np[piece_id + 1])
+                if end <= start:
+                    continue
+                pts = uv_np[start:end]
+                parts.append(pts if local_id == 0 else pts[1:])
+            if not parts:
+                continue
+            polyline = np.concatenate(parts, axis=0)
+            if polyline.shape[0] < 2:
+                continue
+            closed = np.linalg.norm(polyline[0] - polyline[-1]) <= 1e-8
+            if not closed:
+                polyline = np.concatenate((polyline, polyline[:1]), axis=0)
+            d0, s0, _ = project_point_to_polyline(p0_np, polyline)
+            d1, s1, _ = project_point_to_polyline(p1_np, polyline)
+            score = d0 + d1
+            if best is None or score < best[0]:
+                best = (score, polyline, s0, s1)
+        if best is None:
+            return None
+
+        _, polyline, s0, s1 = best
+        deltas = np.diff(polyline, axis=0)
+        lengths = np.linalg.norm(deltas, axis=1)
+        total = float(np.sum(lengths))
+        if total <= 1e-12:
+            return None
+        if s1 < s0:
+            s1 += total
+        if s1 - s0 > 0.5 * total:
+            s0, s1 = s1, s0 + total
+        sample_s = np.linspace(s0, s1, int(n_samples))
+        cumulative = np.concatenate(([0.0], np.cumsum(lengths)))
+        curve = []
+        for value in sample_s:
+            value_wrapped = value % total
+            seg_id = int(np.searchsorted(cumulative, value_wrapped, side='right') - 1)
+            seg_id = min(max(seg_id, 0), len(lengths) - 1)
+            if lengths[seg_id] <= 1e-12:
+                curve.append(polyline[seg_id])
+                continue
+            local_t = (value_wrapped - cumulative[seg_id]) / lengths[seg_id]
+            curve.append(polyline[seg_id] + local_t * deltas[seg_id])
+        return torch.as_tensor(np.asarray(curve), dtype=p0.dtype, device=p0.device)
 
     def sample_smooth_edge_curves_xyz(self, cad_domain: Any, curves_uv: torch.Tensor) -> torch.Tensor:
         """Lift UV curves through a differentiable Torch UV-to-XYZ evaluator."""
@@ -430,17 +565,26 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise ValueError('support_uv and support_xyz must contain the same number of points.')
         original_shape = query_uv.shape[:-1]
         flat_uv = query_uv.reshape(-1, 2)
-        diff = flat_uv[:, None, :] - support_uv[None, :, :]
-        if u_periodic:
-            diff_u = diff[..., 0] - torch.round(diff[..., 0])
-            diff = torch.cat((diff_u.unsqueeze(-1), diff[..., 1:2]), dim=-1)
-        if v_periodic:
-            diff_v = diff[..., 1] - torch.round(diff[..., 1])
-            diff = torch.cat((diff[..., 0:1], diff_v.unsqueeze(-1)), dim=-1)
-        dist = torch.linalg.vector_norm(diff, dim=-1)
         tau_t = flat_uv.new_tensor(self.tube_lift_tau if tau is None else float(tau)).clamp_min(self.eps)
-        weights = torch.softmax(-dist / tau_t, dim=1)
-        xyz = weights @ support_xyz
+        support_count = max(int(support_uv.shape[0]), 1)
+        chunk_size = max(
+            1,
+            min(int(flat_uv.shape[0]), self.tube_lift_max_values // support_count),
+        )
+        xyz_chunks = []
+        for start in range(0, int(flat_uv.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(flat_uv.shape[0]))
+            diff = flat_uv[start:end, None, :] - support_uv[None, :, :]
+            if u_periodic:
+                diff_u = diff[..., 0] - torch.round(diff[..., 0])
+                diff = torch.cat((diff_u.unsqueeze(-1), diff[..., 1:2]), dim=-1)
+            if v_periodic:
+                diff_v = diff[..., 1] - torch.round(diff[..., 1])
+                diff = torch.cat((diff[..., 0:1], diff_v.unsqueeze(-1)), dim=-1)
+            dist = torch.linalg.vector_norm(diff, dim=-1)
+            weights = torch.softmax(-dist / tau_t, dim=1)
+            xyz_chunks.append(weights @ support_xyz)
+        xyz = torch.cat(xyz_chunks, dim=0) if xyz_chunks else support_xyz.new_empty((0, 3))
         return xyz.reshape(*original_shape, 3)
 
     def width(self, w_raw: torch.Tensor, seeds: torch.Tensor | None=None, **_: Any) -> torch.Tensor:
@@ -482,128 +626,6 @@ class ContinuousVoronoiDecoder(nn.Module):
             mask = torch.triu(torch.ones_like(value, dtype=torch.bool), diagonal=1)
             return value[mask].mean()
         return value.reshape(-1).mean()
-
-    def build_swept_tube_fields(
-        self,
-        points_uv: torch.Tensor,
-        points_3d: torch.Tensor,
-        seeds_uv: torch.Tensor,
-        w_raw: torch.Tensor,
-        Xu: torch.Tensor | None=None,
-        Xv: torch.Tensor | None=None,
-        cad_domain: Any | None=None,
-        u_periodic: bool=False,
-        v_periodic: bool=False,
-        return_xyz: bool=True,
-    ) -> dict[str, Any]:
-        topo_out = self.forward_scipy_topology(
-            seeds_uv=seeds_uv,
-            cad_domain=cad_domain,
-            u_periodic=u_periodic,
-            v_periodic=v_periodic,
-            return_xyz=return_xyz,
-            keep_isolated_vertices=False,
-        )
-        w_geo = self.width(w_raw, seeds=seeds_uv)
-        width_uv = self._pair_upper_mean(w_geo)
-        local_scale = self._local_uv_to_xyz_scale(Xu, Xv, points_3d)
-        radius_3d = (width_uv * local_scale).clamp_min(0.0)
-        tau_distance = max(float(self.tube_distance_tau), self.eps) * local_scale.clamp_min(self.eps)
-        tau_density = max(float(self.tube_density_tau), self.eps) * local_scale.clamp_min(self.eps)
-        tau_fiber = max(float(self.tube_fiber_tau), self.eps) * local_scale.clamp_min(self.eps)
-        min_tube_samples = max(int(self.tube_curve_samples), 2)
-        curves_uv = topo_out.get('edge_curves_uv')
-        if curves_uv is None:
-            curves_uv = points_uv.new_empty((0, min_tube_samples, 2))
-        topology_seeds_uv = topo_out.get('topology_seeds_uv', seeds_uv)
-        use_torch_cad = cad_domain is not None and callable(getattr(cad_domain, 'eval_uv_norm_batch_torch', None))
-        if curves_uv.shape[0] > 0:
-            if curves_uv.shape[1] != min_tube_samples:
-                curves_uv = self.sample_graph_edge_curves_uv(
-                    seeds_uv=topology_seeds_uv,
-                    graph=topo_out['graph'],
-                    n_samples=min_tube_samples,
-                    u_periodic=u_periodic,
-                    v_periodic=v_periodic,
-                )
-            if use_torch_cad:
-                coarse_curves_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv)
-            else:
-                coarse_curves_xyz = self.soft_lift_uv_to_xyz(
-                    curves_uv,
-                    points_uv,
-                    points_3d,
-                    u_periodic=u_periodic,
-                    v_periodic=v_periodic,
-                )
-            target_spacing = torch.maximum(
-                float(self.tube_target_spacing_ratio) * radius_3d,
-                points_3d.new_tensor(max(float(self.min_tube_spacing), self.eps)),
-            )
-            tube_samples = self.adaptive_sample_count_from_curves(
-                coarse_curves_xyz,
-                min_samples=min_tube_samples,
-                target_spacing=target_spacing,
-            )
-            if tube_samples != curves_uv.shape[1]:
-                curves_uv = self.sample_graph_edge_curves_uv(
-                    seeds_uv=topology_seeds_uv,
-                    graph=topo_out['graph'],
-                    n_samples=tube_samples,
-                    u_periodic=u_periodic,
-                    v_periodic=v_periodic,
-                )
-                curves_xyz = (
-                    self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv)
-                    if use_torch_cad else
-                    self.soft_lift_uv_to_xyz(curves_uv, points_uv, points_3d, u_periodic=u_periodic, v_periodic=v_periodic)
-                )
-            else:
-                curves_xyz = coarse_curves_xyz
-        else:
-            curves_xyz = points_3d.new_empty((0, min_tube_samples, 3))
-        if use_torch_cad:
-            seeds_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, seeds_uv.reshape(-1, 1, 2)).reshape(-1, 3)
-        else:
-            seeds_xyz = self.soft_lift_uv_to_xyz(
-                seeds_uv,
-                points_uv,
-                points_3d,
-                u_periodic=u_periodic,
-                v_periodic=v_periodic,
-            )
-        if curves_xyz.shape[0] == 0:
-            rho = points_3d.new_zeros((points_3d.shape[0],))
-            fallback = points_3d.new_tensor([1.0, 0.0, 0.0]).expand(points_3d.shape[0], 3)
-            if Xu is not None:
-                fallback = F.normalize(Xu.to(dtype=points_3d.dtype, device=points_3d.device), dim=-1, eps=self.eps)
-            field = {'density': rho, 'fiber': fallback, 'distance': points_3d.new_full((points_3d.shape[0],), float('inf'))}
-        else:
-            field = self.soft_tube_density_and_fiber_to_elements(
-                elem_centers_xyz=points_3d,
-                curves_xyz=curves_xyz,
-                radius=radius_3d,
-                tau_distance=float(tau_distance.detach().item()),
-                tau_density=float(tau_density.detach().item()),
-                tau_fiber=float(tau_fiber.detach().item()),
-                rho_min=float(self.rho_min),
-                fallback_fiber=Xu,
-            )
-        out = dict(topo_out)
-        out.update({
-            'seeds': seeds_uv,
-            'seeds_uv': seeds_uv,
-            'seeds_xyz': seeds_xyz,
-            'rho': field['density'],
-            'density': field['density'],
-            'fiber3d': field['fiber'],
-            'tube_distance': field['distance'],
-            'w_geo': w_geo,
-            'centerline_radius': radius_3d,
-            'edge_curves_uv': curves_uv,
-            'edge_curves_xyz': curves_xyz,
-        })
-        return out
 
     def softmin_distance_to_curves(self, query_xyz: torch.Tensor, curves_xyz: torch.Tensor, tau: float=0.01) -> torch.Tensor:
         """Return each query point's soft-min distance to all curve samples."""
@@ -937,23 +959,37 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise ValueError(f"edge trim reduction must be 'softmin', 'min', or 'mean', got {reduction!r}.")
         return torch.nan_to_num(edge_gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
-    def _safe_div(self, numerator, denominator, eps):
-        sign = torch.where(denominator < 0, -torch.ones_like(denominator), torch.ones_like(denominator))
-        denom = torch.where(denominator.abs() < eps, sign * eps, denominator)
-        return numerator / denom
-
-    def ray_box_intersection_uv(self, origin: torch.Tensor, direction: torch.Tensor, u_periodic: bool=False, v_periodic: bool=False) -> torch.Tensor:
-        """
-                Intersect ray origin + t direction, t > 0, with normalized UV box [0,1]^2.
-                Returns boundary point [2].
-                """
-        hit, _, valid = self.ray_box_hit_torch(origin, direction, u_periodic=u_periodic, v_periodic=v_periodic)
-        return torch.where(valid, hit, origin)
-
     @staticmethod
-    def point_inside_box_np(p: np.ndarray, tol: float=1e-09) -> bool:
-        """Hard topology test for the normalized UV box."""
-        return bool(-tol <= float(p[0]) <= 1.0 + tol and -tol <= float(p[1]) <= 1.0 + tol)
+    def make_box_guard_seeds_np(
+        margin: float = 0.25,
+        per_side: int = 3,
+        dtype=np.float64,
+    ) -> np.ndarray:
+        """
+        Create fixed auxiliary seeds outside the unit square.
+
+        These seeds are not part of the design variables. They only force Qhull
+        to close the Voronoi diagram around the real seeds.
+        """
+        per_side = max(int(per_side), 2)
+        margin = float(margin)
+        t = np.linspace(0.0, 1.0, per_side, dtype=dtype)
+        bottom = np.stack([t, np.full_like(t, -margin)], axis=1)
+        top = np.stack([t, np.full_like(t, 1.0 + margin)], axis=1)
+        left = np.stack([np.full_like(t, -margin), t], axis=1)
+        right = np.stack([np.full_like(t, 1.0 + margin), t], axis=1)
+        corners = np.array(
+            [
+                [-margin, -margin],
+                [1.0 + margin, -margin],
+                [1.0 + margin, 1.0 + margin],
+                [-margin, 1.0 + margin],
+            ],
+            dtype=dtype,
+        )
+        guards = np.concatenate([bottom, right, top, left, corners], axis=0)
+        guards = np.unique(np.round(guards, decimals=14), axis=0).astype(dtype, copy=False)
+        return guards
 
     @staticmethod
     def segment_box_clip_np(p0: np.ndarray, p1: np.ndarray, bounds: tuple[float, float, float, float]=(0.0, 1.0, 0.0, 1.0), tol: float=1e-12) -> tuple[np.ndarray, np.ndarray, float, float] | None:
@@ -977,77 +1013,37 @@ class ContinuousVoronoiDecoder(nn.Module):
         q1 = np.clip(p0 + t_exit * delta, (xmin, ymin), (xmax, ymax))
         return (q0, q1, t_enter, t_exit)
 
-    def ray_box_hit_torch(self, origin: torch.Tensor, direction: torch.Tensor, u_periodic: bool=False, v_periodic: bool=False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the nearest positive box hit as ``(point, t, valid)``."""
-        candidates: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        eps = torch.as_tensor(self.eps, dtype=origin.dtype, device=origin.device)
-        ox, oy = origin.unbind()
-        dx, dy = direction.unbind()
-        if not u_periodic:
-            for value in (0.0, 1.0):
-                u = torch.as_tensor(value, dtype=origin.dtype, device=origin.device)
-                t = self._safe_div(u - ox, dx, eps)
-                y = oy + t * dy
-                valid = (t > eps) & (y >= -eps) & (y <= 1.0 + eps)
-                candidates.append((t, torch.stack((u, y)), valid))
-        if not v_periodic:
-            for value in (0.0, 1.0):
-                v = torch.as_tensor(value, dtype=origin.dtype, device=origin.device)
-                t = self._safe_div(v - oy, dy, eps)
-                x = ox + t * dx
-                valid = (t > eps) & (x >= -eps) & (x <= 1.0 + eps)
-                candidates.append((t, torch.stack((x, v)), valid))
-        if not candidates:
-            return (origin, torch.zeros_like(ox), torch.zeros((), dtype=torch.bool, device=origin.device))
-        big = torch.as_tensor(float('inf'), dtype=origin.dtype, device=origin.device)
-        ts = torch.stack([torch.where(valid, t, big) for t, _, valid in candidates])
-        points = torch.stack([point for _, point, _ in candidates])
-        index = torch.argmin(ts)
-        valid = torch.isfinite(ts[index])
-        point = points[index]
-        hit_u = torch.remainder(point[0], 1.0) if u_periodic else point[0].clamp(0.0, 1.0)
-        hit_v = torch.remainder(point[1], 1.0) if v_periodic else point[1].clamp(0.0, 1.0)
-        hit_candidate = torch.stack((hit_u, hit_v))
-        hit = torch.where(valid, hit_candidate, origin)
-        return (hit, ts[index], valid)
-
-    def choose_valid_boundary_ray_direction(self, origin: torch.Tensor, seed_i: torch.Tensor, seed_j: torch.Tensor, cad_domain: Any | None=None, u_periodic: bool=False, v_periodic: bool=False, all_seeds: torch.Tensor | None=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Validate both perpendicular directions and return the shortest valid hit."""
-        tangent = self.periodic_difference(seed_j, seed_i, u_periodic, v_periodic)
-        normal = torch.stack((-tangent[1], tangent[0]))
-        normal = normal / torch.sqrt((normal * normal).sum() + self.eps)
-        valid_candidates: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] = []
-        for direction in (normal, -normal):
-            hit, t, valid = self.ray_box_hit_torch(origin, direction, u_periodic=u_periodic, v_periodic=v_periodic)
-            midpoint = 0.5 * (origin + hit)
-            boundary_distance = torch.minimum(torch.minimum(hit[0], 1.0 - hit[0]), torch.minimum(hit[1], 1.0 - hit[1])).abs()
-            boundary_ok = boundary_distance <= 0.0001
-            if cad_domain is not None and self.use_trim_activity:
-                midpoint_ok = self.trim_gate(midpoint.unsqueeze(0), cad_domain)[0] > 0.5
-            else:
-                midpoint_ok = self.point_inside_box_np(midpoint.detach().cpu().numpy(), tol=1e-06)
-            if bool((valid & boundary_ok & midpoint_ok).detach().cpu().item()):
-                voronoi_margin = 0.0
-                if all_seeds is not None and all_seeds.shape[0] > 2:
-                    probe = origin + 0.0001 * direction
-                    distances = self.periodic_distance(probe.unsqueeze(0), all_seeds, u_periodic=u_periodic, v_periodic=v_periodic)
-                    pair_distance = 0.5 * (self.periodic_distance(probe, seed_i, u_periodic, v_periodic) + self.periodic_distance(probe, seed_j, u_periodic, v_periodic))
-                    pair_mask = torch.isclose(distances, pair_distance, atol=1e-05, rtol=1e-05)
-                    other_distances = distances.masked_fill(pair_mask, float('inf'))
-                    voronoi_margin = float((other_distances.min() - pair_distance).detach().cpu().item())
-                valid_candidates.append((t, direction, hit, voronoi_margin))
-        if not valid_candidates:
+    @staticmethod
+    def segment_segment_intersection_np(p0: np.ndarray, p1: np.ndarray, q0: np.ndarray, q1: np.ndarray, tol: float=1e-12) -> tuple[float, float, np.ndarray] | None:
+        """Return segment parameters and point for a proper 2-D segment intersection."""
+        p0 = np.asarray(p0, dtype=np.float64)
+        p1 = np.asarray(p1, dtype=np.float64)
+        q0 = np.asarray(q0, dtype=np.float64)
+        q1 = np.asarray(q1, dtype=np.float64)
+        r = p1 - p0
+        s = q1 - q0
+        denom = float(r[0] * s[1] - r[1] * s[0])
+        if abs(denom) <= tol:
             return None
-        best_margin = max((item[3] for item in valid_candidates))
-        best = [item for item in valid_candidates if item[3] >= best_margin - 1e-08]
-        t, direction, hit, _ = min(best, key=lambda item: float(item[0].detach().cpu().item()))
-        return (direction, hit, t)
+        qp = q0 - p0
+        t = float((qp[0] * s[1] - qp[1] * s[0]) / denom)
+        u = float((qp[0] * r[1] - qp[1] * r[0]) / denom)
+        if t < -tol or t > 1.0 + tol or u < -tol or u > 1.0 + tol:
+            return None
+        t = min(max(t, 0.0), 1.0)
+        u = min(max(u, 0.0), 1.0)
+        return (t, u, p0 + t * r)
 
     def build_scipy_voronoi_topology(self, seeds_uv: torch.Tensor, cad_domain: Any | None=None, u_periodic: bool=False, v_periodic: bool=False) -> dict[str, Any]:
         """
-                seeds_uv: torch.Tensor[S,2]
-                Returns topology dict built with scipy.spatial.Voronoi using detached NumPy seeds.
-                """
+        Build a fixed discrete Voronoi graph with SciPy/Qhull.
+
+        SciPy is used only for topology. Fixed guard seeds are appended outside
+        [0, 1]^2 to make real-real ridges finite; guard-related ridges are
+        discarded. Boundary nodes are produced by clipping those finite segments
+        to the UV box or CAD trim curves. No infinite Voronoi ray is
+        reconstructed as topology.
+        """
         if not isinstance(seeds_uv, torch.Tensor):
             raise TypeError('seeds_uv must be a torch.Tensor.')
         if seeds_uv.ndim != 2 or seeds_uv.shape[-1] != 2:
@@ -1059,145 +1055,407 @@ class ContinuousVoronoiDecoder(nn.Module):
         empty_long_3 = lambda: torch.empty((0, 3), dtype=torch.long, device=device)
         empty_float_2 = lambda: torch.empty((0, 2), dtype=dtype, device=device)
 
+        def base_diagnostics() -> dict[str, int]:
+            return {
+                'num_guard_ridges_skipped': 0,
+                'num_real_real_infinite_ridges_skipped': 0,
+                'num_non_segment_ridges_skipped': 0,
+                'num_ridges_outside_box_skipped': 0,
+                'num_ridges_outside_domain_skipped': 0,
+                'num_degenerate_edges_skipped': 0,
+                'num_trim_intersections': 0,
+                'num_trim_split_edges': 0,
+                'num_final_nodes': 0,
+                'num_final_edges': 0,
+            }
+
         def empty_topology() -> dict[str, Any]:
-            return {'triples': empty_long_3(), 'vertex_type': torch.empty((0,), dtype=torch.long, device=device), 'vertex_seed_triples': empty_long_3(), 'boundary_origin_vertex': torch.empty((0,), dtype=torch.long, device=device), 'boundary_target_vertex': torch.empty((0,), dtype=torch.long, device=device), 'boundary_seed_pair': empty_long_2(), 'boundary_ray_dir': empty_float_2(), 'boundary_source_type': torch.empty((0,), dtype=torch.long, device=device), 'edges': empty_long_2(), 'edge_seed_pairs': empty_long_2(), 'edge_type': torch.empty((0,), dtype=torch.long, device=device), 'boundary_rays': empty_long_3(), 'boundary_ray_dirs': empty_float_2(), 'scipy_vertices_np': np.empty((0, 2), dtype=points_np.dtype), 'isolated_vertices': torch.empty((0,), dtype=torch.long, device=device), 'delaunay_triples_np': np.empty((0, 3), dtype=np.int64), 'diagnostics': {'num_finite_edges_inside': 0, 'num_finite_edges_clipped_once': 0, 'num_finite_edges_clipped_twice': 0, 'num_infinite_rays_clipped': 0, 'num_discarded_rays': 0, 'num_raw_scipy_vertices': 0, 'num_raw_boundary_vertices': 0, 'num_pruned_vertices': 0, 'num_final_vertices': 0, 'num_final_interior_vertices': 0, 'num_final_boundary_vertices': 0}}
-        if points_np.shape[0] < 3:
+            return {'vertices_uv': empty_float_2(), 'vertex_type': torch.empty((0,), dtype=torch.long, device=device), 'vertex_seed_triples': empty_long_3(), 'node_clip_source_vertices': empty_long_2(), 'node_trim_curve_piece': torch.empty((0,), dtype=torch.long, device=device), 'node_trim_curve_segment': torch.empty((0,), dtype=torch.long, device=device), 'node_trim_curve_fraction': torch.empty((0,), dtype=dtype, device=device), 'node_trim_segment_uv': torch.empty((0, 2, 2), dtype=dtype, device=device), 'scipy_vertex_aug_seed_triples': empty_long_3(), 'guard_seeds_uv': empty_float_2(), 'boundary_seed_pair': empty_long_2(), 'boundary_source_type': torch.empty((0,), dtype=torch.long, device=device), 'edges': empty_long_2(), 'edge_seed_pairs': empty_long_2(), 'edge_type': torch.empty((0,), dtype=torch.long, device=device), 'diagnostics': base_diagnostics()}
+        num_real = int(points_np.shape[0])
+        if num_real < 3:
             return empty_topology()
-        try:
-            vor = Voronoi(points_np)
-        except Exception:
-            return empty_topology()
-        try:
-            delaunay = Delaunay(points_np)
-            delaunay_triples_np = delaunay.simplices
-        except Exception:
-            delaunay_triples_np = np.empty((0, 3), dtype=np.int64)
-        scipy_vertices_np = vor.vertices
-        if scipy_vertices_np.shape[0] == 0:
-            triples = torch.empty((0, 3), dtype=torch.long, device=device)
+        #This function counts the number of infinite ridges between real seeds in the Voronoi diagram
+        def count_real_real_infinite_ridges(vor_obj: Voronoi) -> int:
+            count = 0
+            for seed_pair, ridge_vertices in zip(vor_obj.ridge_points, vor_obj.ridge_vertices):
+                seed_i = int(seed_pair[0])
+                seed_j = int(seed_pair[1])
+                if seed_i < num_real and seed_j < num_real and any(int(v) < 0 for v in ridge_vertices):
+                    count += 1
+            return count
+
+        if self.use_guard_seeds:
+            vor = None
+            guard_np = np.empty((0, 2), dtype=points_np.dtype)
+            points_for_voronoi_np = points_np
+            max_attempts = max(int(self.guard_seed_max_attempts), 1)
+            expand_factor = max(float(self.guard_seed_expand_factor), 1.0)
+            for attempt in range(max_attempts):
+                margin = float(self.guard_seed_margin) * (expand_factor ** attempt)
+                # Generate guard seeds outside the unit square to help close the Voronoi diagram
+                candidate_guard_np = self.make_box_guard_seeds_np(
+                    margin=margin,
+                    per_side=self.guard_seed_per_side,
+                    dtype=points_np.dtype,
+                )
+                candidate_points_np = np.concatenate([points_np, candidate_guard_np], axis=0)
+                try:
+                    candidate_vor = Voronoi(candidate_points_np)
+                except Exception:
+                    continue
+                vor = candidate_vor
+                guard_np = candidate_guard_np
+                points_for_voronoi_np = candidate_points_np
+                if count_real_real_infinite_ridges(candidate_vor) == 0:
+                    break
+            if vor is None:
+                return empty_topology()
         else:
-            tree = cKDTree(points_np)
-            _, triple_idx_np = tree.query(scipy_vertices_np, k=3)
-            triples = torch.as_tensor(triple_idx_np, dtype=torch.long, device=device)
-            if triples.ndim == 1:
-                triples = triples.reshape(1, 3)
+            guard_np = np.empty((0, 2), dtype=points_np.dtype)
+            points_for_voronoi_np = points_np
+            try:
+                vor = Voronoi(points_for_voronoi_np)
+            except Exception:
+                return empty_topology()
+        scipy_vertices_np = vor.vertices
         num_raw_scipy_vertices = int(scipy_vertices_np.shape[0])
-        vertex_seed_triples = triples.detach().cpu().tolist()
-        vertex_type = [0] * num_raw_scipy_vertices
-        boundary_origin_vertex = [-1] * num_raw_scipy_vertices
-        boundary_target_vertex = [-1] * num_raw_scipy_vertices
-        boundary_seed_pair = [[-1, -1] for _ in range(num_raw_scipy_vertices)]
-        boundary_ray_dir = [[0.0, 0.0] for _ in range(num_raw_scipy_vertices)]
-        boundary_source_type = [0] * num_raw_scipy_vertices
+        diagnostics = base_diagnostics()
+        vertex_seed_triples_by_scipy_id: list[list[int]] = []
+        vertex_aug_seed_triples_by_scipy_id: list[list[int]] = []
+        if num_raw_scipy_vertices > 0:
+            tree = cKDTree(points_np)
+            _, triple_idx_np = tree.query(scipy_vertices_np, k=min(3, num_real))
+            triple_idx_np = np.asarray(triple_idx_np, dtype=np.int64)
+            if triple_idx_np.ndim == 1:
+                triple_idx_np = triple_idx_np.reshape(-1, 1)
+            if triple_idx_np.shape[1] < 3:
+                pad = np.full((triple_idx_np.shape[0], 3 - triple_idx_np.shape[1]), -1, dtype=np.int64)
+                triple_idx_np = np.concatenate([triple_idx_np, pad], axis=1)
+            vertex_seed_triples_by_scipy_id = triple_idx_np[:, :3].tolist()
+            aug_tree = cKDTree(points_for_voronoi_np)
+            _, aug_triple_idx_np = aug_tree.query(scipy_vertices_np, k=3)
+            aug_triple_idx_np = np.asarray(aug_triple_idx_np, dtype=np.int64)
+            if aug_triple_idx_np.ndim == 1:
+                aug_triple_idx_np = aug_triple_idx_np.reshape(1, 3)
+            vertex_aug_seed_triples_by_scipy_id = aug_triple_idx_np[:, :3].tolist()
+
+        node_uv_list: list[np.ndarray] = []
+        node_type_list: list[int] = []
+        node_seed_triples_list: list[list[int]] = []
+        node_clip_source_vertices_list: list[list[int]] = []
+        node_trim_curve_piece_list: list[int] = []
+        node_trim_curve_segment_list: list[int] = []
+        node_trim_curve_fraction_list: list[float] = []
+        node_trim_segment_uv_list: list[list[list[float]]] = []
+        # boundary_seed_pair is retained as metadata; boundary node positions are reconstructed from finite clipped Voronoi segments.
+        boundary_seed_pair_list: list[list[int]] = []
+        # boundary_source_type is used only for shell/CAD bookkeeping.
+        boundary_source_type_list: list[int] = []
+        node_key_to_id: dict[tuple[int, int], int] = {}
         edges: list[list[int]] = []
         edge_seed_pairs: list[list[int]] = []
         edge_types: list[int] = []
-        boundary_rays: list[list[int]] = []
-        boundary_ray_dirs: list[list[float]] = []
-        diagnostics = {'num_finite_edges_inside': 0, 'num_finite_edges_clipped_once': 0, 'num_finite_edges_clipped_twice': 0, 'num_infinite_rays_clipped': 0, 'num_discarded_rays': 0, 'num_raw_scipy_vertices': num_raw_scipy_vertices}
 
-        def add_boundary_vertex(origin_vertex: int, target_vertex: int, seed_i: int, seed_j: int, direction: np.ndarray, source_type: int) -> int:
-            boundary_id = len(vertex_type)
-            vertex_type.append(1)
-            vertex_seed_triples.append([seed_i, seed_j, -1])
-            boundary_origin_vertex.append(origin_vertex)
-            boundary_target_vertex.append(target_vertex)
-            boundary_seed_pair.append([seed_i, seed_j])
-            boundary_ray_dir.append([float(direction[0]), float(direction[1])])
-            boundary_source_type.append(source_type)
-            return boundary_id
+        def as_numpy_maybe(value: Any) -> np.ndarray:
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
+
+        def cad_value(name: str) -> Any | None:
+            if cad_domain is None:
+                return None
+            if isinstance(cad_domain, dict):
+                return cad_domain.get(name)
+            if hasattr(cad_domain, 'boundary_curve_tensors'):
+                try:
+                    boundary_data = cad_domain.boundary_curve_tensors(as_torch=True)
+                    if isinstance(boundary_data, dict) and name in boundary_data:
+                        return boundary_data[name]
+                except Exception:
+                    pass
+            if hasattr(cad_domain, name):
+                return getattr(cad_domain, name)
+            private_name = f'_{name}'
+            if hasattr(cad_domain, private_name):
+                return getattr(cad_domain, private_name)
+            return None
+
+        boundary_curve_uv_np = cad_value('boundary_curve_uv')
+        boundary_curve_offsets_np = cad_value('boundary_curve_offsets')
+        if boundary_curve_uv_np is not None and boundary_curve_offsets_np is not None:
+            boundary_curve_uv_np = as_numpy_maybe(boundary_curve_uv_np).astype(np.float64, copy=False)
+            boundary_curve_offsets_np = as_numpy_maybe(boundary_curve_offsets_np).astype(np.int64, copy=False)
+            if boundary_curve_uv_np.ndim != 2 or boundary_curve_uv_np.shape[-1] != 2 or boundary_curve_offsets_np.ndim != 1 or boundary_curve_offsets_np.size < 2:
+                boundary_curve_uv_np = None
+                boundary_curve_offsets_np = None
+        trim_sdf_grid_np = cad_value('seed_domain_sdf_grid')
+        if trim_sdf_grid_np is not None:
+            trim_sdf_grid_np = as_numpy_maybe(trim_sdf_grid_np).astype(np.float64, copy=False)
+            if trim_sdf_grid_np.ndim != 2:
+                trim_sdf_grid_np = None
+        has_trim_domain = boundary_curve_uv_np is not None and boundary_curve_offsets_np is not None and trim_sdf_grid_np is not None
+
+        def sample_trim_sdf_np(p: np.ndarray) -> float:
+            if trim_sdf_grid_np is None:
+                return 1.0
+            u = float(np.clip(p[0], 0.0, 1.0))
+            v = float(np.clip(p[1], 0.0, 1.0))
+            height, width = trim_sdf_grid_np.shape
+            x = u * float(width - 1)
+            y = v * float(height - 1)
+            x0 = int(np.floor(x))
+            y0 = int(np.floor(y))
+            x1 = min(x0 + 1, width - 1)
+            y1 = min(y0 + 1, height - 1)
+            sx = x - float(x0)
+            sy = y - float(y0)
+            v00 = trim_sdf_grid_np[y0, x0]
+            v10 = trim_sdf_grid_np[y0, x1]
+            v01 = trim_sdf_grid_np[y1, x0]
+            v11 = trim_sdf_grid_np[y1, x1]
+            return float((1.0 - sx) * (1.0 - sy) * v00 + sx * (1.0 - sy) * v10 + (1.0 - sx) * sy * v01 + sx * sy * v11)
+
+        def trim_segment_intersections(q0: np.ndarray, q1: np.ndarray) -> list[dict[str, Any]]:
+            if not has_trim_domain:
+                return []
+            hits: list[dict[str, Any]] = []
+            for piece_id in range(int(boundary_curve_offsets_np.size - 1)):
+                start = int(boundary_curve_offsets_np[piece_id])
+                end = int(boundary_curve_offsets_np[piece_id + 1])
+                points = boundary_curve_uv_np[start:end]
+                if points.shape[0] < 2:
+                    continue
+                for local_seg_id in range(points.shape[0] - 1):
+                    r0 = points[local_seg_id]
+                    r1 = points[local_seg_id + 1]
+                    hit = self.segment_segment_intersection_np(q0, q1, r0, r1, tol=max(self.clip_tol, 1e-12))
+                    if hit is None:
+                        continue
+                    t, u, point = hit
+                    if t <= self.clip_tol or t >= 1.0 - self.clip_tol:
+                        continue
+                    hits.append({
+                        't': t,
+                        'u': u,
+                        'point': point.astype(points_np.dtype, copy=False),
+                        'piece_id': piece_id,
+                        'segment_id': start + local_seg_id,
+                        'segment_uv': np.stack((r0, r1), axis=0).astype(points_np.dtype, copy=False),
+                    })
+            hits.sort(key=lambda item: item['t'])
+            unique_hits: list[dict[str, Any]] = []
+            for hit in hits:
+                if unique_hits and abs(float(hit['t']) - float(unique_hits[-1]['t'])) <= max(self.clip_tol, self.node_merge_tol):
+                    continue
+                unique_hits.append(hit)
+            return unique_hits
+
+        def trim_inside_subsegments(q0: np.ndarray, q1: np.ndarray) -> list[dict[str, Any]]:
+            if not has_trim_domain:
+                return [{'q0': q0, 'q1': q1, 't0': 0.0, 't1': 1.0, 'hit0': None, 'hit1': None}]
+            hits = trim_segment_intersections(q0, q1)
+            diagnostics['num_trim_intersections'] += len(hits)
+            cuts = [0.0] + [float(hit['t']) for hit in hits] + [1.0]
+            delta = q1 - q0
+            kept: list[dict[str, Any]] = []
+            for index in range(len(cuts) - 1):
+                t0 = cuts[index]
+                t1 = cuts[index + 1]
+                if t1 - t0 <= self.node_merge_tol:
+                    continue
+                midpoint = q0 + (0.5 * (t0 + t1)) * delta
+                if sample_trim_sdf_np(midpoint) < -self.clip_tol:
+                    continue
+                kept.append({
+                    'q0': (q0 + t0 * delta).astype(points_np.dtype, copy=False),
+                    'q1': (q0 + t1 * delta).astype(points_np.dtype, copy=False),
+                    't0': t0,
+                    't1': t1,
+                    'hit0': hits[index - 1] if index > 0 else None,
+                    'hit1': hits[index] if index < len(hits) else None,
+                })
+            return kept
+
+        def node_key_np(p: np.ndarray) -> tuple[int, int]:
+            scale = 1.0 / max(float(self.node_merge_tol), 1e-12)
+            return (int(round(float(p[0]) * scale)), int(round(float(p[1]) * scale)))
+
+        def is_boundary_point_np(p: np.ndarray, tol: float=1e-8) -> bool:
+            return (
+                abs(float(p[0])) <= tol
+                or abs(float(p[0]) - 1.0) <= tol
+                or abs(float(p[1])) <= tol
+                or abs(float(p[1]) - 1.0) <= tol
+            )
+
+        def add_node_from_uv(
+            p: np.ndarray,
+            seed_i: int,
+            seed_j: int,
+            scipy_vertex_id: int = -1,
+            clip_source_vertices: tuple[int, int] = (-1, -1),
+            source_type_if_boundary: int = 2,
+            trim_hit: dict[str, Any] | None = None,
+        ) -> int:
+            p = np.asarray(p, dtype=points_np.dtype)
+            p = np.clip(p, [0.0, 0.0], [1.0, 1.0])
+            key = node_key_np(p)
+            if key in node_key_to_id:
+                return node_key_to_id[key]
+            node_id = len(node_uv_list)
+            node_key_to_id[key] = node_id
+            node_uv_list.append(p)
+            node_clip_source_vertices_list.append([int(clip_source_vertices[0]), int(clip_source_vertices[1])])
+            if trim_hit is None:
+                node_trim_curve_piece_list.append(-1)
+                node_trim_curve_segment_list.append(-1)
+                node_trim_curve_fraction_list.append(0.0)
+                node_trim_segment_uv_list.append([[-1.0, -1.0], [-1.0, -1.0]])
+            else:
+                node_trim_curve_piece_list.append(int(trim_hit['piece_id']))
+                node_trim_curve_segment_list.append(int(trim_hit['segment_id']))
+                node_trim_curve_fraction_list.append(float(trim_hit['u']))
+                node_trim_segment_uv_list.append(np.asarray(trim_hit['segment_uv'], dtype=points_np.dtype).tolist())
+            if trim_hit is not None or is_boundary_point_np(p, tol=max(self.clip_tol, self.node_merge_tol)):
+                node_type_list.append(1)
+                node_seed_triples_list.append([seed_i, seed_j, -1])
+                boundary_seed_pair_list.append([seed_i, seed_j])
+                boundary_source_type_list.append(5 if trim_hit is not None else source_type_if_boundary)
+            else:
+                node_type_list.append(0)
+                if 0 <= scipy_vertex_id < len(vertex_seed_triples_by_scipy_id):
+                    triple = vertex_seed_triples_by_scipy_id[scipy_vertex_id]
+                else:
+                    triple = [seed_i, seed_j, -1]
+                triple = [int(x) if 0 <= int(x) < num_real else -1 for x in triple]
+                node_seed_triples_list.append(triple)
+                boundary_seed_pair_list.append([-1, -1])
+                boundary_source_type_list.append(0)
+            return node_id
+
         for seed_pair, ridge_vertices in zip(vor.ridge_points, vor.ridge_vertices):
+            seed_i = int(seed_pair[0]) # Index for the first seed in the ridge pair
+            seed_j = int(seed_pair[1]) # Index for the second seed in the ridge pair
+            if not (seed_i < num_real and seed_j < num_real):
+                diagnostics['num_guard_ridges_skipped'] += 1
+                continue
+            if any(int(v) < 0 for v in ridge_vertices):
+                diagnostics['num_real_real_infinite_ridges_skipped'] += 1
+                continue
             finite_vertices = [int(v) for v in ridge_vertices if int(v) >= 0]
-            seed_i = int(seed_pair[0])
-            seed_j = int(seed_pair[1])
-            if len(finite_vertices) == 2:
-                a, b = finite_vertices
-                pa, pb = (scipy_vertices_np[a], scipy_vertices_np[b])
-                clipped = self.segment_box_clip_np(pa, pb)
-                if clipped is None:
-                    continue
-                _, _, t_enter, t_exit = clipped
-                a_inside = self.point_inside_box_np(pa)
-                b_inside = self.point_inside_box_np(pb)
-                if a_inside and b_inside:
-                    edges.append([a, b])
-                    edge_seed_pairs.append([seed_i, seed_j])
-                    edge_types.append(0)
-                    diagnostics['num_finite_edges_inside'] += 1
-                elif a_inside != b_inside:
-                    inside_id, outside_id = (a, b) if a_inside else (b, a)
-                    direction = scipy_vertices_np[outside_id] - scipy_vertices_np[inside_id]
-                    direction /= np.linalg.norm(direction) + 1e-12
-                    boundary_id = add_boundary_vertex(inside_id, outside_id, seed_i, seed_j, direction, 2)
-                    edges.append([inside_id, boundary_id])
-                    edge_seed_pairs.append([seed_i, seed_j])
-                    edge_types.append(1)
-                    diagnostics['num_finite_edges_clipped_once'] += 1
-                elif t_exit - t_enter > 1e-12:
-                    direction_ab = pb - pa
-                    direction_ab /= np.linalg.norm(direction_ab) + 1e-12
-                    entry_id = add_boundary_vertex(a, b, seed_i, seed_j, direction_ab, 2)
-                    exit_id = add_boundary_vertex(b, a, seed_i, seed_j, -direction_ab, 2)
-                    edges.append([entry_id, exit_id])
-                    edge_seed_pairs.append([seed_i, seed_j])
-                    edge_types.append(3)
-                    diagnostics['num_finite_edges_clipped_twice'] += 1
-            elif len(finite_vertices) == 1 and any((int(v) == -1 for v in ridge_vertices)):
-                finite_v = finite_vertices[0]
-                origin = torch.as_tensor(scipy_vertices_np[finite_v], dtype=dtype, device=device)
-                selected = self.choose_valid_boundary_ray_direction(origin, seeds_uv[seed_i].detach(), seeds_uv[seed_j].detach(), cad_domain=cad_domain, u_periodic=u_periodic, v_periodic=v_periodic, all_seeds=seeds_uv.detach())
-                if selected is None:
-                    diagnostics['num_discarded_rays'] += 1
-                    continue
-                direction_t, _, _ = selected
-                direction = direction_t.detach().cpu().numpy()
-                boundary_id = add_boundary_vertex(finite_v, -1, seed_i, seed_j, direction, 1)
-                edges.append([finite_v, boundary_id])
-                edge_seed_pairs.append([seed_i, seed_j])
-                edge_types.append(1)
-                boundary_rays.append([finite_v, seed_i, seed_j])
-                boundary_ray_dirs.append([float(direction[0]), float(direction[1])])
-                diagnostics['num_infinite_rays_clipped'] += 1
-        referenced = set()
-        for e in edges:
-            referenced.add(e[0])
-            referenced.add(e[1])
-        for r in boundary_rays:
-            referenced.add(r[0])
-        all_ids = set(range(num_raw_scipy_vertices))
-        isolated = sorted(list(all_ids - referenced))
-        isolated_t = torch.as_tensor(isolated, dtype=torch.long, device=device)
-        edges_t = torch.as_tensor(edges, dtype=torch.long, device=device)
-        if edges_t.numel() == 0:
-            edges_t = torch.empty((0, 2), dtype=torch.long, device=device)
-        else:
-            edges_t = edges_t.reshape(-1, 2)
-        edge_seed_pairs_t = torch.as_tensor(edge_seed_pairs, dtype=torch.long, device=device)
-        if edge_seed_pairs_t.numel() == 0:
-            edge_seed_pairs_t = torch.empty((0, 2), dtype=torch.long, device=device)
-        else:
-            edge_seed_pairs_t = edge_seed_pairs_t.reshape(-1, 2)
-        boundary_rays_t = torch.as_tensor(boundary_rays, dtype=torch.long, device=device)
-        if boundary_rays_t.numel() == 0:
-            boundary_rays_t = torch.empty((0, 3), dtype=torch.long, device=device)
-        else:
-            boundary_rays_t = boundary_rays_t.reshape(-1, 3)
-        boundary_ray_dirs_t = torch.as_tensor(boundary_ray_dirs, dtype=seeds_uv.dtype, device=device)
-        if boundary_ray_dirs_t.numel() == 0:
-            boundary_ray_dirs_t = torch.empty((0, 2), dtype=seeds_uv.dtype, device=device)
-        else:
-            boundary_ray_dirs_t = boundary_ray_dirs_t.reshape(-1, 2)
-        vertex_seed_triples_t = torch.as_tensor(vertex_seed_triples, dtype=torch.long, device=device).reshape(-1, 3)
-        vertex_type_t = torch.as_tensor(vertex_type, dtype=torch.long, device=device)
-        boundary_origin_vertex_t = torch.as_tensor(boundary_origin_vertex, dtype=torch.long, device=device)
-        boundary_target_vertex_t = torch.as_tensor(boundary_target_vertex, dtype=torch.long, device=device)
-        boundary_seed_pair_t = torch.as_tensor(boundary_seed_pair, dtype=torch.long, device=device).reshape(-1, 2)
-        boundary_ray_dir_t = torch.as_tensor(boundary_ray_dir, dtype=dtype, device=device).reshape(-1, 2)
-        boundary_source_type_t = torch.as_tensor(boundary_source_type, dtype=torch.long, device=device)
-        diagnostics['num_raw_boundary_vertices'] = len(vertex_type) - num_raw_scipy_vertices
-        return {'triples': vertex_seed_triples_t, 'vertex_type': vertex_type_t, 'vertex_seed_triples': vertex_seed_triples_t, 'boundary_origin_vertex': boundary_origin_vertex_t, 'boundary_target_vertex': boundary_target_vertex_t, 'boundary_seed_pair': boundary_seed_pair_t, 'boundary_ray_dir': boundary_ray_dir_t, 'boundary_source_type': boundary_source_type_t, 'edges': edges_t, 'edge_seed_pairs': edge_seed_pairs_t, 'edge_type': torch.as_tensor(edge_types, dtype=torch.long, device=device), 'boundary_rays': boundary_rays_t, 'boundary_ray_dirs': boundary_ray_dirs_t, 'scipy_vertices_np': scipy_vertices_np, 'isolated_vertices': isolated_t, 'delaunay_triples_np': delaunay_triples_np, 'diagnostics': diagnostics}
+            if len(finite_vertices) != 2:
+                diagnostics['num_non_segment_ridges_skipped'] += 1
+                continue
+            a, b = finite_vertices
+            pa = scipy_vertices_np[a]
+            pb = scipy_vertices_np[b]
+            clipped = self.segment_box_clip_np(
+                pa,
+                pb,
+                bounds=(0.0, 1.0, 0.0, 1.0),
+                tol=self.clip_tol,
+            )
+            if clipped is None:
+                diagnostics['num_ridges_outside_box_skipped'] += 1
+                diagnostics['num_ridges_outside_domain_skipped'] += 1
+                continue
+            q0, q1, t_enter, t_exit = clipped
+            if np.linalg.norm(q1 - q0) <= self.node_merge_tol:
+                diagnostics['num_degenerate_edges_skipped'] += 1
+                continue
+            subsegments = trim_inside_subsegments(q0, q1)
+            if len(subsegments) > 1:
+                diagnostics['num_trim_split_edges'] += len(subsegments) - 1
+            raw_span = float(t_exit - t_enter)
 
-    def prune_graph_vertices(self, nodes_uv: torch.Tensor, vertex_type: torch.Tensor, vertex_seed_triples: torch.Tensor, boundary_origin_vertex: torch.Tensor, boundary_target_vertex: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_ray_dir: torch.Tensor, boundary_source_type: torch.Tensor, edges: torch.Tensor, edge_seed_pairs: torch.Tensor, edge_type: torch.Tensor, alpha: torch.Tensor | None=None, keep_isolated_vertices: bool=False) -> dict[str, torch.Tensor | int | None]:
+            def endpoint_source(local_t: float, hit: dict[str, Any] | None) -> tuple[int, tuple[int, int], dict[str, Any] | None]:
+                if hit is not None:
+                    return (-1, (a, b), hit)
+                raw_t = float(t_enter + local_t * raw_span)
+                if abs(raw_t) <= self.clip_tol:
+                    return (a, (a, -1), None)
+                if abs(raw_t - 1.0) <= self.clip_tol:
+                    return (b, (b, -1), None)
+                return (-1, (a, b), None)
+
+            for subsegment in subsegments:
+                q_sub0 = subsegment['q0']
+                q_sub1 = subsegment['q1']
+                if np.linalg.norm(q_sub1 - q_sub0) <= self.node_merge_tol:
+                    diagnostics['num_degenerate_edges_skipped'] += 1
+                    continue
+                scipy0, source0, trim_hit0 = endpoint_source(float(subsegment['t0']), subsegment['hit0'])
+                scipy1, source1, trim_hit1 = endpoint_source(float(subsegment['t1']), subsegment['hit1'])
+                id0 = add_node_from_uv(
+                    q_sub0,
+                    seed_i,
+                    seed_j,
+                    scipy_vertex_id=scipy0,
+                    clip_source_vertices=source0,
+                    source_type_if_boundary=2,
+                    trim_hit=trim_hit0,
+                )
+                id1 = add_node_from_uv(
+                    q_sub1,
+                    seed_i,
+                    seed_j,
+                    scipy_vertex_id=scipy1,
+                    clip_source_vertices=source1,
+                    source_type_if_boundary=2,
+                    trim_hit=trim_hit1,
+                )
+                if id0 == id1:
+                    diagnostics['num_degenerate_edges_skipped'] += 1
+                    continue
+                edges.append([id0, id1])
+                edge_seed_pairs.append([seed_i, seed_j])
+                if node_type_list[id0] == 0 and node_type_list[id1] == 0:
+                    edge_types.append(0)
+                elif node_type_list[id0] != node_type_list[id1]:
+                    edge_types.append(1)
+                else:
+                    edge_types.append(3)
+
+        vertices_uv = torch.as_tensor(
+            np.asarray(node_uv_list, dtype=points_np.dtype).reshape(-1, 2),
+            dtype=dtype,
+            device=device,
+        )
+        vertex_type_t = torch.as_tensor(node_type_list, dtype=torch.long, device=device)
+        vertex_seed_triples_t = torch.as_tensor(
+            node_seed_triples_list,
+            dtype=torch.long,
+            device=device,
+        ).reshape(-1, 3)
+        boundary_seed_pair_t = torch.as_tensor(
+            boundary_seed_pair_list,
+            dtype=torch.long,
+            device=device,
+        ).reshape(-1, 2)
+        boundary_source_type_t = torch.as_tensor(boundary_source_type_list, dtype=torch.long, device=device)
+        node_clip_source_vertices_t = torch.as_tensor(
+            node_clip_source_vertices_list,
+            dtype=torch.long,
+            device=device,
+        ).reshape(-1, 2)
+        node_trim_curve_piece_t = torch.as_tensor(node_trim_curve_piece_list, dtype=torch.long, device=device)
+        node_trim_curve_segment_t = torch.as_tensor(node_trim_curve_segment_list, dtype=torch.long, device=device)
+        node_trim_curve_fraction_t = torch.as_tensor(node_trim_curve_fraction_list, dtype=dtype, device=device)
+        node_trim_segment_uv_t = torch.as_tensor(node_trim_segment_uv_list, dtype=dtype, device=device).reshape(-1, 2, 2)
+        scipy_vertex_aug_seed_triples_t = torch.as_tensor(
+            vertex_aug_seed_triples_by_scipy_id,
+            dtype=torch.long,
+            device=device,
+        ).reshape(-1, 3)
+        guard_seeds_uv_t = torch.as_tensor(guard_np, dtype=dtype, device=device).reshape(-1, 2)
+        edges_t = torch.as_tensor(edges, dtype=torch.long, device=device).reshape(-1, 2)
+        edge_seed_pairs_t = torch.as_tensor(edge_seed_pairs, dtype=torch.long, device=device).reshape(-1, 2)
+        edge_type_t = torch.as_tensor(edge_types, dtype=torch.long, device=device)
+        if self.strict_guard_topology and diagnostics['num_real_real_infinite_ridges_skipped'] > 0:
+            raise RuntimeError("Guard seeds failed to close all real-real ridges.")
+        return {'vertices_uv': vertices_uv, 'vertex_type': vertex_type_t, 'vertex_seed_triples': vertex_seed_triples_t, 'scipy_vertex_aug_seed_triples': scipy_vertex_aug_seed_triples_t, 'guard_seeds_uv': guard_seeds_uv_t, 'node_clip_source_vertices': node_clip_source_vertices_t, 'node_trim_segment_uv': node_trim_segment_uv_t, 'node_trim_curve_piece': node_trim_curve_piece_t, 'node_trim_curve_segment': node_trim_curve_segment_t, 'node_trim_curve_fraction': node_trim_curve_fraction_t, 'boundary_seed_pair': boundary_seed_pair_t, 'boundary_source_type': boundary_source_type_t, 'edges': edges_t, 'edge_seed_pairs': edge_seed_pairs_t, 'edge_type': edge_type_t, 'diagnostics': diagnostics}
+
+    def prune_graph_vertices(self, nodes_uv: torch.Tensor, vertex_type: torch.Tensor, vertex_seed_triples: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_source_type: torch.Tensor, edges: torch.Tensor, edge_seed_pairs: torch.Tensor, edge_type: torch.Tensor, alpha: torch.Tensor | None=None, keep_isolated_vertices: bool=False) -> dict[str, torch.Tensor | int | None]:
         """Compact topology to vertices participating in the final edge graph."""
         num_vertices = int(nodes_uv.shape[0])
         device = nodes_uv.device
@@ -1211,217 +1469,109 @@ class ContinuousVoronoiDecoder(nn.Module):
         old_to_new[active_ids] = torch.arange(active_ids.numel(), device=device)
         compact_edges = old_to_new[edges] if edges.numel() > 0 else edges.reshape(0, 2)
 
-        def remap_reference(values: torch.Tensor) -> torch.Tensor:
-            compact = values[active_ids].clone()
-            valid = (compact >= 0) & (compact < num_vertices)
-            compact[valid] = old_to_new[compact[valid]]
-            compact[~valid] = -1
-            return compact
         compact_type = vertex_type[active_ids]
-        return {'nodes_uv': nodes_uv[active_ids], 'vertex_type': compact_type, 'vertex_seed_triples': vertex_seed_triples[active_ids], 'boundary_origin_vertex': remap_reference(boundary_origin_vertex), 'boundary_target_vertex': remap_reference(boundary_target_vertex), 'boundary_seed_pair': boundary_seed_pair[active_ids], 'boundary_ray_dir': boundary_ray_dir[active_ids], 'boundary_source_type': boundary_source_type[active_ids], 'edges': compact_edges, 'edge_seed_pairs': edge_seed_pairs, 'edge_type': edge_type, 'alpha': None if alpha is None else alpha[active_ids], 'old_to_new': old_to_new, 'active_vertex_ids': active_ids, 'num_pruned_vertices': num_vertices - int(active_ids.numel())}
+        return {'nodes_uv': nodes_uv[active_ids], 'vertex_type': compact_type, 'vertex_seed_triples': vertex_seed_triples[active_ids], 'boundary_seed_pair': boundary_seed_pair[active_ids], 'boundary_source_type': boundary_source_type[active_ids], 'edges': compact_edges, 'edge_seed_pairs': edge_seed_pairs, 'edge_type': edge_type, 'alpha': None if alpha is None else alpha[active_ids], 'old_to_new': old_to_new, 'active_vertex_ids': active_ids}
 
-    def differentiable_vertices_from_topology(self, seeds_uv: torch.Tensor, vertex_type: torch.Tensor, vertex_seed_triples: torch.Tensor, boundary_origin_vertex: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_ray_dir: torch.Tensor, u_periodic: bool=False, v_periodic: bool=False, cad_domain: Any | None=None, boundary_target_vertex: torch.Tensor | None=None, boundary_source_type: torch.Tensor | None=None) -> torch.Tensor:
-        """Reconstruct unified SciPy topology with differentiable coordinates."""
+    def differentiable_vertices_from_topology(self, seeds_uv: torch.Tensor, vertex_type: torch.Tensor, vertex_seed_triples: torch.Tensor, u_periodic: bool=False, v_periodic: bool=False, cad_domain: Any | None=None, boundary_source_type: torch.Tensor | None=None, topology_vertices_uv: torch.Tensor | None=None, node_clip_source_vertices: torch.Tensor | None=None, scipy_vertex_aug_seed_triples: torch.Tensor | None=None, guard_seeds_uv: torch.Tensor | None=None, node_trim_segment_uv: torch.Tensor | None=None) -> torch.Tensor:
+        """
+        Reconstruct topology nodes differentiably from finite clipped ridges.
+
+        Requires ``node_clip_source_vertices``, ``scipy_vertex_aug_seed_triples``,
+        ``guard_seeds_uv``, and stored ``topology_vertices_uv`` from the finite
+        guard-seed topology. Raw SciPy vertices are recomputed from augmented
+        seed triples. Guard seeds are detached constants, so gradients flow only
+        through real seed coordinates. Boundary nodes are intersections on
+        finite Voronoi segments; infinite ray directions are not used.
+        """
         num_vertices = vertex_type.shape[0]
         if num_vertices == 0:
             return torch.empty((0, 2), dtype=seeds_uv.dtype, device=seeds_uv.device)
+        required = (
+            topology_vertices_uv is not None
+            and node_clip_source_vertices is not None
+            and scipy_vertex_aug_seed_triples is not None
+            and guard_seeds_uv is not None
+            and scipy_vertex_aug_seed_triples.numel() > 0
+        )
+        if not required:
+            raise ValueError(
+                "finite-segment topology reconstruction requires topology_vertices_uv, "
+                "node_clip_source_vertices, scipy_vertex_aug_seed_triples, and guard_seeds_uv."
+            )
+
         zero_node = torch.zeros((2,), dtype=seeds_uv.dtype, device=seeds_uv.device)
         node_values = [zero_node for _ in range(num_vertices)]
-        if boundary_target_vertex is None:
-            boundary_target_vertex = torch.full_like(boundary_origin_vertex, -1)
         if boundary_source_type is None:
             boundary_source_type = vertex_type
-        interior_ids = torch.nonzero(vertex_type == 0, as_tuple=False).flatten()
-        if interior_ids.numel() > 0:
-            triples = vertex_seed_triples[interior_ids]
-            interior_nodes = self.differentiable_vertices_from_triples(seeds_uv, triples, u_periodic, v_periodic)
-            for local_id, vertex_id in enumerate(interior_ids.tolist()):
-                node_values[vertex_id] = interior_nodes[local_id]
-        for boundary_id in torch.nonzero(vertex_type == 1, as_tuple=False).flatten().tolist():
-            origin_id = int(boundary_origin_vertex[boundary_id].item())
-            if origin_id < 0 or origin_id >= num_vertices:
-                continue
-            pair = boundary_seed_pair[boundary_id]
-            i, j = (int(pair[0].item()), int(pair[1].item()))
-            stored_direction = boundary_ray_dir[boundary_id].to(dtype=seeds_uv.dtype)
-            source_type = int(boundary_source_type[boundary_id].item())
-            if source_type == 2:
-                target_id = int(boundary_target_vertex[boundary_id].item())
-                if target_id < 0 or target_id >= num_vertices:
+        topology_vertices_uv = topology_vertices_uv.to(dtype=seeds_uv.dtype, device=seeds_uv.device)
+        guard_seeds_uv = guard_seeds_uv.to(dtype=seeds_uv.dtype, device=seeds_uv.device).detach()
+        augmented_seeds_uv = torch.cat((seeds_uv, guard_seeds_uv), dim=0)
+        raw_voronoi_vertices = self.differentiable_vertices_from_triples(
+            augmented_seeds_uv,
+            scipy_vertex_aug_seed_triples.to(device=seeds_uv.device),
+            u_periodic=False,
+            v_periodic=False,
+        )
+        node_clip_source_vertices = node_clip_source_vertices.to(device=seeds_uv.device)
+        if node_trim_segment_uv is not None:
+            node_trim_segment_uv = node_trim_segment_uv.to(dtype=seeds_uv.dtype, device=seeds_uv.device)
+
+        def line_line_point(p0: torch.Tensor, p1: torch.Tensor, q0: torch.Tensor, q1: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
+            r = p1 - p0
+            s = q1 - q0
+            denom = r[0] * s[1] - r[1] * s[0]
+            if not bool((denom.abs() > self.eps).detach().cpu().item()):
+                return fallback
+            qp = q0 - p0
+            t = (qp[0] * s[1] - qp[1] * s[0]) / denom
+            return (p0 + t * r).clamp(0.0, 1.0)
+
+        def clipped_source_point(source_vertices: torch.Tensor, stored_point: torch.Tensor, source_type: int, vertex_id: int) -> torch.Tensor:
+            a = int(source_vertices[0].item())
+            b = int(source_vertices[1].item())
+            if not (0 <= a < raw_voronoi_vertices.shape[0]):
+                raise RuntimeError("Finite-segment topology node is missing a valid raw SciPy source vertex.")
+            p0 = raw_voronoi_vertices[a]
+            if b < 0 or b >= raw_voronoi_vertices.shape[0]:
+                return p0.clamp(0.0, 1.0)
+            p1 = raw_voronoi_vertices[b]
+            d = p1 - p0
+            if source_type == 5 and node_trim_segment_uv is not None:
+                trim_seg = node_trim_segment_uv[vertex_id]
+                if bool((trim_seg >= 0.0).all().detach().cpu().item()):
+                    return line_line_point(p0, p1, trim_seg[0], trim_seg[1], stored_point)
+            tol = max(float(self.clip_tol), float(self.node_merge_tol), self.eps)
+            x0 = stored_point[0]
+            y0 = stored_point[1]
+            on_left = abs(float(x0.detach().cpu().item())) <= tol
+            on_right = abs(float(x0.detach().cpu().item()) - 1.0) <= tol
+            on_bottom = abs(float(y0.detach().cpu().item())) <= tol
+            on_top = abs(float(y0.detach().cpu().item()) - 1.0) <= tol
+            if (on_left or on_right) and bool((d[0].abs() > self.eps).detach().cpu().item()):
+                x = torch.zeros((), dtype=seeds_uv.dtype, device=seeds_uv.device) if on_left else torch.ones((), dtype=seeds_uv.dtype, device=seeds_uv.device)
+                t = (x - p0[0]) / d[0]
+                y = p0[1] + t * d[1]
+                return torch.stack((x, y.clamp(0.0, 1.0)))
+            if (on_bottom or on_top) and bool((d[1].abs() > self.eps).detach().cpu().item()):
+                y = torch.zeros((), dtype=seeds_uv.dtype, device=seeds_uv.device) if on_bottom else torch.ones((), dtype=seeds_uv.dtype, device=seeds_uv.device)
+                t = (y - p0[1]) / d[1]
+                x = p0[0] + t * d[0]
+                return torch.stack((x.clamp(0.0, 1.0), y))
+            return stored_point
+
+        for vertex_id in range(num_vertices):
+            source_type = int(boundary_source_type[vertex_id].item())
+            source_vertices = node_clip_source_vertices[vertex_id]
+            if not bool((source_vertices >= 0).any().detach().cpu().item()):
+                if source_type in (4, 6):
+                    node_values[vertex_id] = topology_vertices_uv[vertex_id]
                     continue
-                direction = node_values[target_id] - node_values[origin_id]
-                direction = direction / torch.sqrt((direction * direction).sum() + self.eps)
-            elif 0 <= i < seeds_uv.shape[0] and 0 <= j < seeds_uv.shape[0]:
-                tangent = self.periodic_difference(seeds_uv[j], seeds_uv[i], u_periodic, v_periodic)
-                direction = torch.stack((-tangent[1], tangent[0]))
-                direction = direction / torch.sqrt((direction * direction).sum() + self.eps)
-                sign = torch.where(torch.dot(direction, stored_direction) < 0, -torch.ones((), dtype=seeds_uv.dtype, device=seeds_uv.device), torch.ones((), dtype=seeds_uv.dtype, device=seeds_uv.device))
-                direction = direction * sign
-            else:
-                direction = stored_direction
-                direction = direction / torch.sqrt((direction * direction).sum() + self.eps)
-            node_values[boundary_id] = self.ray_box_intersection_uv(node_values[origin_id], direction, u_periodic=u_periodic, v_periodic=v_periodic)
+                raise RuntimeError("Finite-segment topology node is missing clip-source metadata.")
+            node_values[vertex_id] = clipped_source_point(source_vertices, topology_vertices_uv[vertex_id], source_type, vertex_id)
         return torch.stack(node_values, dim=0)
 
-    def _box_bisector_intersections(self, seed_i: torch.Tensor, seed_j: torch.Tensor, tol: float=1e-07) -> list[torch.Tensor]:
-        """Return the two intersections of a pair bisector with the UV box."""
-        midpoint = 0.5 * (seed_i + seed_j)
-        tangent = seed_j - seed_i
-        direction = torch.stack((-tangent[1], tangent[0]))
-        candidates: list[torch.Tensor] = []
-        if bool((direction[0].abs() > tol).detach().cpu().item()):
-            for u_value in (0.0, 1.0):
-                u = torch.as_tensor(u_value, dtype=midpoint.dtype, device=midpoint.device)
-                t = (u - midpoint[0]) / direction[0]
-                v = midpoint[1] + t * direction[1]
-                if bool(((v >= -tol) & (v <= 1.0 + tol)).detach().cpu().item()):
-                    candidates.append(torch.stack((u, v.clamp(0.0, 1.0))))
-        if bool((direction[1].abs() > tol).detach().cpu().item()):
-            for v_value in (0.0, 1.0):
-                v = torch.as_tensor(v_value, dtype=midpoint.dtype, device=midpoint.device)
-                t = (v - midpoint[1]) / direction[1]
-                u = midpoint[0] + t * direction[0]
-                if bool(((u >= -tol) & (u <= 1.0 + tol)).detach().cpu().item()):
-                    candidates.append(torch.stack((u.clamp(0.0, 1.0), v)))
-        unique: list[torch.Tensor] = []
-        for candidate in candidates:
-            if not any((torch.linalg.vector_norm(candidate.detach() - other.detach()) <= tol for other in unique)):
-                unique.append(candidate)
-        return unique
-
-    def _pair_boundary_candidate_alpha(self, seeds_uv: torch.Tensor, pair: torch.Tensor, candidate: torch.Tensor, seed_activity: torch.Tensor | None=None) -> torch.Tensor:
-        """Soft nearest-pair validity at a bisector-boundary intersection."""
-        i, j = (int(pair[0].item()), int(pair[1].item()))
-        distances = self.periodic_distance(candidate.unsqueeze(0), seeds_uv)
-        pair_distance = 0.5 * (distances[i] + distances[j])
-        mask = torch.ones_like(distances, dtype=torch.bool)
-        mask[i] = False
-        mask[j] = False
-        if bool(mask.any().detach().cpu().item()):
-            margin = distances[mask].min() - pair_distance
-            nearest_gate = torch.sigmoid(margin / self._tau_tensor(self.tau_voronoi, seeds_uv))
-        else:
-            nearest_gate = torch.ones((), dtype=seeds_uv.dtype, device=seeds_uv.device)
-        equality_gate = torch.exp(-((distances[i] - distances[j]) / self._tau_tensor(self.tau_voronoi, seeds_uv)) ** 2)
-        activity = torch.ones((), dtype=seeds_uv.dtype, device=seeds_uv.device)
-        if seed_activity is not None:
-            activity = seed_activity[i] * seed_activity[j]
-        return (activity * nearest_gate * equality_gate).clamp(0.0, 1.0)
-
-    def _cad_bisector_intersections(self, seed_i: torch.Tensor, seed_j: torch.Tensor, cad_domain: Any, samples: int=129) -> list[torch.Tensor]:
-        """Find trim-boundary crossings along the box-clipped pair bisector."""
-        segment = self._box_bisector_intersections(seed_i, seed_j)
-        if len(segment) != 2:
-            return []
-        t = torch.linspace(0.0, 1.0, samples, dtype=seed_i.dtype, device=seed_i.device)
-        points = segment[0].unsqueeze(0) + t.unsqueeze(1) * (segment[1] - segment[0]).unsqueeze(0)
-        if hasattr(cad_domain, 'sample_trim_sdf'):
-            values = cad_domain.sample_trim_sdf(points)
-            values = torch.as_tensor(values, dtype=seed_i.dtype, device=seed_i.device).reshape(-1)
-        elif hasattr(cad_domain, 'smooth_inside_activity'):
-            values = cad_domain.smooth_inside_activity(points, tau=self.tau_trim)
-            values = torch.as_tensor(values, dtype=seed_i.dtype, device=seed_i.device).reshape(-1) - 0.5
-        else:
-            return []
-        intersections: list[torch.Tensor] = []
-        for index in range(samples - 1):
-            a, b = (values[index], values[index + 1])
-            crosses = (a == 0) | (b == 0) | ((a < 0) != (b < 0))
-            if not bool(crosses.detach().cpu().item()):
-                continue
-            weight = (a / (a - b + self.eps)).clamp(0.0, 1.0)
-            point = points[index] + weight * (points[index + 1] - points[index])
-            if not intersections or torch.linalg.vector_norm(point.detach() - intersections[-1].detach()) > 0.0001:
-                intersections.append(point)
-        return intersections
-
-    def add_pair_boundary_candidates(self, seeds_uv: torch.Tensor, nodes_uv: torch.Tensor, node_alpha: torch.Tensor, node_type: torch.Tensor, node_seed_triples: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_source_type: torch.Tensor, edges: torch.Tensor, edge_seed_pairs: torch.Tensor, edge_type: torch.Tensor, cad_domain: Any | None=None, seed_activity: torch.Tensor | None=None, hard_validity: bool=True, tol: float=0.0001) -> dict[str, torch.Tensor]:
-        """Add missing valid pair-bisector intersections and their Voronoi edges."""
-        device, dtype = (seeds_uv.device, seeds_uv.dtype)
-        pairs = torch.combinations(torch.arange(seeds_uv.shape[0], device=device), r=2)
-        added_nodes: list[torch.Tensor] = []
-        added_alpha: list[torch.Tensor] = []
-        added_pairs: list[list[int]] = []
-        added_edges: list[list[int]] = []
-        added_edge_pairs: list[list[int]] = []
-        added_edge_types: list[int] = []
-        for pair in pairs:
-            i, j = (int(pair[0].item()), int(pair[1].item()))
-            if cad_domain is None:
-                candidates = self._box_bisector_intersections(seeds_uv[i], seeds_uv[j])
-            elif hasattr(cad_domain, 'intersect_bisector_boundary'):
-                raw = cad_domain.intersect_bisector_boundary(seeds_uv[i], seeds_uv[j])
-                raw = torch.as_tensor(raw, dtype=dtype, device=device).reshape(-1, 2)
-                candidates = list(raw.unbind(0))
-            else:
-                candidates = self._cad_bisector_intersections(seeds_uv[i], seeds_uv[j], cad_domain)
-            pair_in_triple = (node_seed_triples == i).any(dim=1) & (node_seed_triples == j).any(dim=1) & (node_type == 0) if node_seed_triples.numel() > 0 else torch.zeros((nodes_uv.shape[0],), dtype=torch.bool, device=device)
-            interior_ids = torch.nonzero(pair_in_triple, as_tuple=False).flatten()
-            if interior_ids.numel() > 0:
-                inside = (nodes_uv[interior_ids, 0] >= -tol) & (nodes_uv[interior_ids, 0] <= 1.0 + tol) & (nodes_uv[interior_ids, 1] >= -tol) & (nodes_uv[interior_ids, 1] <= 1.0 + tol) & (node_alpha[interior_ids] >= 0.5)
-                interior_ids = interior_ids[inside]
-            valid_for_pair: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for candidate in candidates:
-                alpha = self._pair_boundary_candidate_alpha(seeds_uv, pair, candidate, seed_activity)
-                if hard_validity and float(alpha.detach().cpu().item()) < 0.5:
-                    continue
-                existing_pair = (boundary_seed_pair[:, 0] == i) & (boundary_seed_pair[:, 1] == j) | (boundary_seed_pair[:, 0] == j) & (boundary_seed_pair[:, 1] == i) if boundary_seed_pair.numel() > 0 else torch.zeros((nodes_uv.shape[0],), dtype=torch.bool, device=device)
-                existing_ids = torch.nonzero(existing_pair, as_tuple=False).flatten()
-                if existing_ids.numel() > 0 and bool((torch.linalg.vector_norm(nodes_uv[existing_ids].detach() - candidate.detach(), dim=1).min() <= tol).detach().cpu().item()):
-                    continue
-                valid_for_pair.append((candidate, alpha))
-            if interior_ids.numel() == 0 and len(valid_for_pair) == 2:
-                midpoint = 0.5 * (valid_for_pair[0][0] + valid_for_pair[1][0])
-                midpoint_alpha = self._pair_boundary_candidate_alpha(seeds_uv, pair, midpoint, seed_activity)
-                domain_ok = self.trim_gate(midpoint.unsqueeze(0), cad_domain)[0] > 0.5 if cad_domain is not None else torch.ones((), dtype=torch.bool, device=device)
-                if float(midpoint_alpha.detach().cpu().item()) < 0.5 or not bool(domain_ok.detach().cpu().item()):
-                    valid_for_pair = []
-            new_ids: list[int] = []
-            for candidate, alpha in valid_for_pair:
-                target = None
-                if interior_ids.numel() > 0:
-                    distances = torch.linalg.vector_norm(nodes_uv[interior_ids].detach() - candidate.detach(), dim=1)
-                    target = int(interior_ids[torch.argmin(distances)].item())
-                    segment_midpoint = 0.5 * (candidate + nodes_uv[target])
-                    midpoint_alpha = self._pair_boundary_candidate_alpha(seeds_uv, pair, segment_midpoint, seed_activity)
-                    domain_ok = self.trim_gate(segment_midpoint.unsqueeze(0), cad_domain)[0] > 0.5 if cad_domain is not None else torch.ones((), dtype=torch.bool, device=device)
-                    if float(midpoint_alpha.detach().cpu().item()) < 0.5 or not bool(domain_ok.detach().cpu().item()):
-                        continue
-                new_id = nodes_uv.shape[0] + len(added_nodes)
-                added_nodes.append(candidate)
-                added_alpha.append(alpha)
-                added_pairs.append([i, j])
-                new_ids.append(new_id)
-                if target is not None:
-                    added_edges.append([target, new_id])
-                    added_edge_pairs.append([i, j])
-                    added_edge_types.append(1)
-            if interior_ids.numel() == 0 and len(new_ids) == 2:
-                midpoint = 0.5 * (valid_for_pair[0][0] + valid_for_pair[1][0])
-                midpoint_alpha = self._pair_boundary_candidate_alpha(seeds_uv, pair, midpoint, seed_activity)
-                if float(midpoint_alpha.detach().cpu().item()) >= 0.5:
-                    added_edges.append(new_ids)
-                    added_edge_pairs.append([i, j])
-                    added_edge_types.append(3)
-        if not added_nodes:
-            return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type, 'edges': edges, 'edge_seed_pairs': edge_seed_pairs, 'edge_type': edge_type}
-        added_nodes_t = torch.stack(added_nodes)
-        added_pairs_t = torch.as_tensor(added_pairs, dtype=torch.long, device=device)
-        added_count = added_nodes_t.shape[0]
-        nodes_uv = torch.cat((nodes_uv, added_nodes_t), dim=0)
-        node_alpha = torch.cat((node_alpha, torch.stack(added_alpha)), dim=0)
-        node_type = torch.cat((node_type, torch.ones(added_count, dtype=torch.long, device=device)))
-        node_seed_triples = torch.cat((node_seed_triples, torch.cat((added_pairs_t, -torch.ones((added_count, 1), dtype=torch.long, device=device)), dim=1)), dim=0)
-        boundary_seed_pair = torch.cat((boundary_seed_pair, added_pairs_t), dim=0)
-        boundary_source_type = torch.cat((boundary_source_type, torch.full((added_count,), 3, dtype=torch.long, device=device)))
-        if added_edges:
-            edges = torch.cat((edges, torch.as_tensor(added_edges, dtype=torch.long, device=device)), dim=0)
-            edge_seed_pairs = torch.cat((edge_seed_pairs, torch.as_tensor(added_edge_pairs, dtype=torch.long, device=device)), dim=0)
-            edge_type = torch.cat((edge_type, torch.as_tensor(added_edge_types, dtype=torch.long, device=device)))
-        return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type, 'edges': edges, 'edge_seed_pairs': edge_seed_pairs, 'edge_type': edge_type}
-
     def add_box_shell_corners(self, nodes_uv: torch.Tensor, node_alpha: torch.Tensor, node_type: torch.Tensor, node_seed_triples: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_source_type: torch.Tensor, tol: float=0.0001) -> dict[str, torch.Tensor]:
-        """Append missing UV-box corners as boundary shell nodes (source type 4)."""
+        """Append missing UV-box corners used by retained shell edges (source type 4)."""
         device, dtype = (nodes_uv.device, nodes_uv.dtype)
         corners = torch.tensor([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=dtype, device=device)
         missing = []
@@ -1434,8 +1584,56 @@ class ContinuousVoronoiDecoder(nn.Module):
         count = added.shape[0]
         return {'nodes_uv': torch.cat((nodes_uv, added), dim=0), 'node_alpha': torch.cat((node_alpha, torch.ones(count, dtype=dtype, device=device))), 'node_type': torch.cat((node_type, torch.ones(count, dtype=torch.long, device=device))), 'node_seed_triples': torch.cat((node_seed_triples, torch.full((count, 3), -1, dtype=torch.long, device=device))), 'boundary_seed_pair': torch.cat((boundary_seed_pair, torch.full((count, 2), -1, dtype=torch.long, device=device))), 'boundary_source_type': torch.cat((boundary_source_type, torch.full((count,), 4, dtype=torch.long, device=device)))}
 
+    def add_cad_boundary_curve_endpoints(self, nodes_uv: torch.Tensor, node_alpha: torch.Tensor, node_type: torch.Tensor, node_seed_triples: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_source_type: torch.Tensor, cad_domain: Any | None=None, tol: float=1e-06) -> dict[str, torch.Tensor]:
+        """Append CAD boundary C1-piece endpoints used by retained shell edges (source type 6)."""
+        if cad_domain is None:
+            return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type}
+        boundary_uv = None
+        boundary_offsets = None
+        if isinstance(cad_domain, dict):
+            boundary_uv = cad_domain.get('boundary_curve_uv')
+            boundary_offsets = cad_domain.get('boundary_curve_offsets')
+        elif hasattr(cad_domain, 'boundary_curve_tensors'):
+            try:
+                data = cad_domain.boundary_curve_tensors(as_torch=True)
+                boundary_uv = data.get('boundary_curve_uv') if isinstance(data, dict) else None
+                boundary_offsets = data.get('boundary_curve_offsets') if isinstance(data, dict) else None
+            except Exception:
+                boundary_uv = None
+                boundary_offsets = None
+        if boundary_uv is None or boundary_offsets is None:
+            return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type}
+        boundary_uv = torch.as_tensor(boundary_uv, dtype=nodes_uv.dtype, device=nodes_uv.device).reshape(-1, 2)
+        boundary_offsets = torch.as_tensor(boundary_offsets, dtype=torch.long, device=nodes_uv.device).reshape(-1)
+        if boundary_uv.numel() == 0 or boundary_offsets.numel() < 2:
+            return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type}
+        endpoint_ids = []
+        for piece_id in range(int(boundary_offsets.numel() - 1)):
+            start = int(boundary_offsets[piece_id].item())
+            end = int(boundary_offsets[piece_id + 1].item())
+            if end <= start:
+                continue
+            endpoint_ids.append(start)
+            endpoint_ids.append(end - 1)
+        if not endpoint_ids:
+            return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type}
+        boundary_endpoints = boundary_uv[torch.as_tensor(endpoint_ids, dtype=torch.long, device=nodes_uv.device)]
+        keep = []
+        existing = nodes_uv.detach()
+        tol_t = torch.as_tensor(float(tol), dtype=nodes_uv.dtype, device=nodes_uv.device)
+        for point in boundary_endpoints:
+            if existing.numel() > 0 and bool((torch.linalg.vector_norm(existing - point, dim=1) <= tol_t).any().detach().cpu().item()):
+                continue
+            keep.append(point)
+            existing = torch.cat((existing, point.reshape(1, 2).detach()), dim=0)
+        if not keep:
+            return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type}
+        added = torch.stack(keep, dim=0)
+        count = int(added.shape[0])
+        return {'nodes_uv': torch.cat((nodes_uv, added), dim=0), 'node_alpha': torch.cat((node_alpha, torch.ones((count,), dtype=nodes_uv.dtype, device=nodes_uv.device))), 'node_type': torch.cat((node_type, torch.ones((count,), dtype=torch.long, device=nodes_uv.device))), 'node_seed_triples': torch.cat((node_seed_triples, torch.full((count, 3), -1, dtype=torch.long, device=nodes_uv.device))), 'boundary_seed_pair': torch.cat((boundary_seed_pair, torch.full((count, 2), -1, dtype=torch.long, device=nodes_uv.device))), 'boundary_source_type': torch.cat((boundary_source_type, torch.full((count,), 6, dtype=torch.long, device=nodes_uv.device)))}
+
     def build_boundary_loop_edges(self, nodes_uv: torch.Tensor, vertex_type: torch.Tensor, cad_domain: Any | None=None, tol: float=0.0001) -> tuple[torch.Tensor, torch.Tensor]:
-        """Connect boundary nodes cyclically in shell-parameter order."""
+        """Connect boundary nodes cyclically as shell edges for CAD/box curve sampling."""
         device = nodes_uv.device
         boundary_ids = torch.nonzero(vertex_type == 1, as_tuple=False).flatten()
         if boundary_ids.numel() < 2:
@@ -1502,8 +1700,9 @@ class ContinuousVoronoiDecoder(nn.Module):
     def forward_scipy_topology(self, seeds_uv: torch.Tensor, cad_domain: Any | None=None, u_periodic: bool=False, v_periodic: bool=False, return_xyz: bool | None=None, keep_isolated_vertices: bool=False) -> dict[str, Any]:
         """
                 - SciPy builds graph topology without gradients.
-                - PyTorch recomputes vertex positions with gradients.
-                - Therefore gradients flow through geometry, not topology.
+                - Guard-seed topology stores clipped UV node coordinates directly.
+                - Gradients flow through downstream edge sampling and gates, not
+                  through the detached SciPy/Qhull topology construction.
                 """
         if not isinstance(seeds_uv, torch.Tensor):
             raise TypeError('seeds_uv must be a torch.Tensor.')
@@ -1511,6 +1710,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             raise ValueError(f'seeds_uv must have shape [S, 2], got {tuple(seeds_uv.shape)}.')
         if not seeds_uv.is_floating_point():
             raise TypeError('seeds_uv must be a floating point tensor.')
+
         want_xyz = self.return_xyz if return_xyz is None else bool(return_xyz)
         original_seeds_uv = seeds_uv
         seed_active_ids = torch.arange(seeds_uv.shape[0], dtype=torch.long, device=seeds_uv.device)
@@ -1540,7 +1740,13 @@ class ContinuousVoronoiDecoder(nn.Module):
 
         with torch.no_grad():
             topo = self.build_scipy_voronoi_topology(seeds_uv, cad_domain=cad_domain, u_periodic=u_periodic, v_periodic=v_periodic)
-        vertices_uv = self.differentiable_vertices_from_topology(seeds_uv=seeds_uv, vertex_type=topo['vertex_type'], vertex_seed_triples=topo['vertex_seed_triples'], boundary_origin_vertex=topo['boundary_origin_vertex'], boundary_seed_pair=topo['boundary_seed_pair'], boundary_ray_dir=topo['boundary_ray_dir'], u_periodic=u_periodic, v_periodic=v_periodic, cad_domain=cad_domain, boundary_target_vertex=topo['boundary_target_vertex'], boundary_source_type=topo['boundary_source_type'])
+            try:
+                delaunay_triples_np = Delaunay(seeds_uv.detach().cpu().numpy()).simplices
+            except Exception:
+                delaunay_triples_np = np.empty((0, 3), dtype=np.int64)
+        vertices_uv = self.differentiable_vertices_from_topology(seeds_uv=seeds_uv, vertex_type=topo['vertex_type'], vertex_seed_triples=topo['vertex_seed_triples'], u_periodic=u_periodic, v_periodic=v_periodic, cad_domain=cad_domain, boundary_source_type=topo['boundary_source_type'], topology_vertices_uv=topo.get('vertices_uv'), node_clip_source_vertices=topo.get('node_clip_source_vertices'), scipy_vertex_aug_seed_triples=topo.get('scipy_vertex_aug_seed_triples'), guard_seeds_uv=topo.get('guard_seeds_uv'), node_trim_segment_uv=topo.get('node_trim_segment_uv'))
+        # node_alpha is a soft validity/activity weight for edge/tube activity;
+        # it is not used for topology trimming.
         alpha = torch.ones((vertices_uv.shape[0],), dtype=seeds_uv.dtype, device=seeds_uv.device)
         if cad_domain is not None and self.use_trim_activity:
             alpha = alpha * self.trim_gate(vertices_uv, cad_domain)
@@ -1549,12 +1755,21 @@ class ContinuousVoronoiDecoder(nn.Module):
         if cad_domain is None:
             boundary_mask = topo['vertex_type'] == 1
             alpha = torch.where(boundary_mask, torch.ones_like(alpha), alpha)
-        num_before_pair_completion = int(vertices_uv.shape[0])
-        augmented = self.add_pair_boundary_candidates(seeds_uv=seeds_uv, nodes_uv=vertices_uv, node_alpha=alpha, node_type=topo['vertex_type'], node_seed_triples=topo['vertex_seed_triples'], boundary_seed_pair=topo['boundary_seed_pair'], boundary_source_type=topo['boundary_source_type'], edges=topo['edges'], edge_seed_pairs=topo['edge_seed_pairs'], edge_type=topo['edge_type'], cad_domain=cad_domain, hard_validity=True)
-        num_pair_boundary_vertices = int(augmented['nodes_uv'].shape[0]) - num_before_pair_completion
-        if cad_domain is None:
+        augmented = {
+    "nodes_uv": vertices_uv,
+    "node_alpha": alpha,
+    "node_type": topo["vertex_type"],
+    "node_seed_triples": topo["vertex_seed_triples"],
+    "boundary_seed_pair": topo["boundary_seed_pair"],
+    "boundary_source_type": topo["boundary_source_type"],
+    "edges": topo["edges"],
+    "edge_seed_pairs": topo["edge_seed_pairs"],
+    "edge_type": topo["edge_type"],
+}
+        if cad_domain is not None:
+            augmented.update(self.add_cad_boundary_curve_endpoints(nodes_uv=augmented['nodes_uv'], node_alpha=augmented['node_alpha'], node_type=augmented['node_type'], node_seed_triples=augmented['node_seed_triples'], boundary_seed_pair=augmented['boundary_seed_pair'], boundary_source_type=augmented['boundary_source_type'], cad_domain=cad_domain))
+        else:
             augmented.update(self.add_box_shell_corners(nodes_uv=augmented['nodes_uv'], node_alpha=augmented['node_alpha'], node_type=augmented['node_type'], node_seed_triples=augmented['node_seed_triples'], boundary_seed_pair=augmented['boundary_seed_pair'], boundary_source_type=augmented['boundary_source_type']))
-        num_corner_vertices = int((augmented['boundary_source_type'] == 4).sum().item()) - int((topo['boundary_source_type'] == 4).sum().item())
         total_added = int(augmented['nodes_uv'].shape[0]) - int(vertices_uv.shape[0])
         vertices_uv = augmented['nodes_uv']
         alpha = augmented['node_alpha']
@@ -1566,39 +1781,36 @@ class ContinuousVoronoiDecoder(nn.Module):
         topo['edge_seed_pairs'] = augmented['edge_seed_pairs']
         topo['edge_type'] = augmented['edge_type']
         if total_added > 0:
-            topo['boundary_origin_vertex'] = torch.cat((topo['boundary_origin_vertex'], torch.full((total_added,), -1, dtype=torch.long, device=seeds_uv.device)))
-            topo['boundary_target_vertex'] = torch.cat((topo['boundary_target_vertex'], torch.full((total_added,), -1, dtype=torch.long, device=seeds_uv.device)))
-            topo['boundary_ray_dir'] = torch.cat((topo['boundary_ray_dir'], torch.zeros((total_added, 2), dtype=seeds_uv.dtype, device=seeds_uv.device)))
+            if 'node_clip_source_vertices' in topo:
+                topo['node_clip_source_vertices'] = torch.cat((topo['node_clip_source_vertices'], torch.full((total_added, 2), -1, dtype=torch.long, device=seeds_uv.device)))
+            if 'node_trim_curve_piece' in topo:
+                topo['node_trim_curve_piece'] = torch.cat((topo['node_trim_curve_piece'], torch.full((total_added,), -1, dtype=torch.long, device=seeds_uv.device)))
+            if 'node_trim_curve_segment' in topo:
+                topo['node_trim_curve_segment'] = torch.cat((topo['node_trim_curve_segment'], torch.full((total_added,), -1, dtype=torch.long, device=seeds_uv.device)))
+            if 'node_trim_curve_fraction' in topo:
+                topo['node_trim_curve_fraction'] = torch.cat((topo['node_trim_curve_fraction'], torch.zeros((total_added,), dtype=seeds_uv.dtype, device=seeds_uv.device)))
+            if 'node_trim_segment_uv' in topo:
+                topo['node_trim_segment_uv'] = torch.cat((topo['node_trim_segment_uv'], torch.full((total_added, 2, 2), -1.0, dtype=seeds_uv.dtype, device=seeds_uv.device)))
         loop_edges, loop_edge_type = self.build_boundary_loop_edges(vertices_uv, topo['vertex_type'], cad_domain=cad_domain)
         base_edges = topo['edges']
         edges = torch.cat((base_edges, loop_edges), dim=0)
         edge_type = torch.cat((topo['edge_type'], loop_edge_type), dim=0)
         loop_seed_pairs = torch.full((loop_edges.shape[0], 2), -1, dtype=torch.long, device=seeds_uv.device)
         edge_seed_pairs = torch.cat((topo['edge_seed_pairs'], loop_seed_pairs), dim=0)
-        pruned = self.prune_graph_vertices(nodes_uv=vertices_uv, vertex_type=topo['vertex_type'], vertex_seed_triples=topo['vertex_seed_triples'], boundary_origin_vertex=topo['boundary_origin_vertex'], boundary_target_vertex=topo['boundary_target_vertex'], boundary_seed_pair=topo['boundary_seed_pair'], boundary_ray_dir=topo['boundary_ray_dir'], boundary_source_type=topo['boundary_source_type'], edges=edges, edge_seed_pairs=edge_seed_pairs, edge_type=edge_type, alpha=alpha, keep_isolated_vertices=keep_isolated_vertices)
-        inactive_vertex_ids = torch.nonzero(pruned['old_to_new'] < 0, as_tuple=False).flatten()
-        pruned_vertices_uv = vertices_uv[inactive_vertex_ids]
-        pruned_vertex_type = topo['vertex_type'][inactive_vertex_ids]
+        pruned = self.prune_graph_vertices(nodes_uv=vertices_uv, vertex_type=topo['vertex_type'], vertex_seed_triples=topo['vertex_seed_triples'], boundary_seed_pair=topo['boundary_seed_pair'], boundary_source_type=topo['boundary_source_type'], edges=edges, edge_seed_pairs=edge_seed_pairs, edge_type=edge_type, alpha=alpha, keep_isolated_vertices=keep_isolated_vertices)
         vertices_uv = pruned['nodes_uv']
         alpha = pruned['alpha']
         edges = pruned['edges']
         edge_seed_pairs = pruned['edge_seed_pairs']
         edge_type = pruned['edge_type']
-        for key in ('vertex_type', 'vertex_seed_triples', 'boundary_origin_vertex', 'boundary_target_vertex', 'boundary_seed_pair', 'boundary_ray_dir', 'boundary_source_type'):
+        for key in ('vertex_type', 'vertex_seed_triples', 'boundary_seed_pair', 'boundary_source_type'):
             topo[key] = pruned[key]
         old_to_new = pruned['old_to_new']
-        boundary_rays = topo['boundary_rays'].clone()
-        if boundary_rays.numel() > 0:
-            mapped_ray_origins = old_to_new[boundary_rays[:, 0]]
-            keep_rays = mapped_ray_origins >= 0
-            boundary_rays = boundary_rays[keep_rays]
-            boundary_rays[:, 0] = mapped_ray_origins[keep_rays]
-            boundary_ray_dirs = topo['boundary_ray_dirs'][keep_rays]
-        else:
-            boundary_ray_dirs = topo['boundary_ray_dirs']
+        for key in ('node_clip_source_vertices', 'node_trim_curve_piece', 'node_trim_curve_segment', 'node_trim_curve_fraction', 'node_trim_segment_uv'):
+            if key in topo and topo[key].shape[0] == old_to_new.shape[0]:
+                topo[key] = topo[key][pruned['active_vertex_ids']]
         diagnostics = dict(topo['diagnostics'])
-        diagnostics['num_raw_boundary_vertices'] = diagnostics.get('num_raw_boundary_vertices', 0) + total_added
-        diagnostics.update({'num_pair_boundary_vertices': num_pair_boundary_vertices, 'num_corner_shell_vertices': num_corner_vertices, 'num_pruned_vertices': pruned['num_pruned_vertices'], 'num_final_vertices': int(vertices_uv.shape[0]), 'num_final_interior_vertices': int((topo['vertex_type'] == 0).sum().item()), 'num_final_boundary_vertices': int((topo['vertex_type'] == 1).sum().item())})
+        diagnostics.update({'num_final_nodes': int(vertices_uv.shape[0]), 'num_final_edges': int(edges.shape[0])})
         topo['diagnostics'] = diagnostics
         if edges.numel() == 0:
             edge_alpha = torch.empty((0,), dtype=seeds_uv.dtype, device=seeds_uv.device)
@@ -1608,7 +1820,25 @@ class ContinuousVoronoiDecoder(nn.Module):
         active_interior = topo['vertex_type'] == 0
         num_interior = int(active_interior.sum().item())
         num_boundary = int((topo['vertex_type'] == 1).sum().item())
-        graph = {'nodes_uv': vertices_uv, 'node_alpha': alpha, 'node_type': topo['vertex_type'], 'node_degree': vertex_degree, 'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_alpha': edge_alpha, 'edge_type': edge_type, 'vertex_degree': vertex_degree, 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': [{0: 'interior', 1: 'infinite_ray_clipping', 2: 'finite_edge_clipping', 3: 'pair_bisector_boundary', 4: 'corner_shell'}.get(int(value), 'unknown') for value in topo['boundary_source_type'].detach().cpu().tolist()], 'diagnostics': topo['diagnostics'], 'num_interior_nodes': num_interior, 'num_boundary_nodes': num_boundary}
+        graph = {'nodes_uv': vertices_uv, 'node_alpha': alpha, 'node_type': topo['vertex_type'], 'node_degree': vertex_degree, 'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_alpha': edge_alpha, 'edge_type': edge_type, 'vertex_degree': vertex_degree, 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': [{0: 'interior', 1: 'finite_box_boundary', 2: 'finite_edge_clipping', 3: 'finite_boundary_boundary', 4: 'corner_shell', 5: 'trim_boundary_intersection', 6: 'cad_boundary_curve_sample'}.get(int(value), 'unknown') for value in topo['boundary_source_type'].detach().cpu().tolist()], 'diagnostics': topo['diagnostics'], 'num_interior_nodes': num_interior, 'num_boundary_nodes': num_boundary}
+        for key in ('node_trim_curve_piece', 'node_trim_curve_segment', 'node_trim_curve_fraction', 'node_trim_segment_uv'):
+            if key in topo:
+                graph[key] = topo[key]
+        if cad_domain is not None:
+            boundary_data = cad_domain if isinstance(cad_domain, dict) else None
+            if boundary_data is None and hasattr(cad_domain, 'boundary_curve_tensors'):
+                try:
+                    boundary_data = cad_domain.boundary_curve_tensors(as_torch=True)
+                except Exception:
+                    boundary_data = None
+            if isinstance(boundary_data, dict):
+                for key in ('boundary_curve_uv', 'boundary_curve_offsets', 'boundary_curve_loop_id'):
+                    if key in boundary_data:
+                        value = boundary_data[key]
+                        if isinstance(value, torch.Tensor):
+                            graph[key] = value.to(device=vertices_uv.device, dtype=vertices_uv.dtype if key == 'boundary_curve_uv' else torch.long)
+                        else:
+                            graph[key] = torch.as_tensor(value, device=vertices_uv.device, dtype=vertices_uv.dtype if key == 'boundary_curve_uv' else torch.long)
         if 'edge_seed_pair' in graph:
             local_pairs = graph['edge_seed_pair']
             valid_pair_mask = local_pairs >= 0
@@ -1642,7 +1872,10 @@ class ContinuousVoronoiDecoder(nn.Module):
         graph['edge_trim_alpha'] = edge_trim_alpha
         graph['edge_curves_uv_for_trim'] = edge_curves_uv_for_trim
         edge_alpha = graph['edge_alpha']
-        out: dict[str, Any] = {'vertices_uv': vertices_uv, 'alpha': alpha, 'triple_idx': topo['vertex_seed_triples'], 'vertex_type': topo['vertex_type'], 'vertex_seed_triples': topo['vertex_seed_triples'], 'boundary_origin_vertex': topo['boundary_origin_vertex'], 'boundary_target_vertex': topo['boundary_target_vertex'], 'boundary_seed_pair': topo['boundary_seed_pair'], 'boundary_ray_dir': topo['boundary_ray_dir'], 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': graph['boundary_source_name'], 'edges': {'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_alpha': edge_alpha, 'vertex_degree': vertex_degree, 'edge_type': edge_type, 'edge_trim_alpha': edge_trim_alpha}, 'boundary_rays': boundary_rays, 'boundary_ray_dirs': boundary_ray_dirs, 'scipy_vertices_np': topo['scipy_vertices_np'], 'pruned_vertices_uv': pruned_vertices_uv, 'pruned_vertex_type': pruned_vertex_type, 'isolated_vertices': torch.nonzero(vertex_degree == 0, as_tuple=False).flatten() if keep_isolated_vertices else torch.empty((0,), dtype=torch.long, device=seeds_uv.device), 'delaunay_triples_np': topo['delaunay_triples_np'], 'mode': 'scipy_topology', 'vertex_degree': vertex_degree, 'graph': graph, 'diagnostics': topo['diagnostics']}
+        out: dict[str, Any] = {'vertices_uv': vertices_uv, 'alpha': alpha, 'vertex_type': topo['vertex_type'], 'vertex_seed_triples': topo['vertex_seed_triples'], 'boundary_seed_pair': topo['boundary_seed_pair'], 'boundary_source_type': topo['boundary_source_type'], 'boundary_source_name': graph['boundary_source_name'], 'edges': {'edge_index': edges, 'edge_seed_pair': edge_seed_pairs, 'edge_alpha': edge_alpha, 'vertex_degree': vertex_degree, 'edge_type': edge_type, 'edge_trim_alpha': edge_trim_alpha}, 'delaunay_triples_np': delaunay_triples_np, 'mode': 'scipy_topology', 'vertex_degree': vertex_degree, 'graph': graph, 'diagnostics': topo['diagnostics'], 'node_clip_source_vertices': topo.get('node_clip_source_vertices'), 'scipy_vertex_aug_seed_triples': topo.get('scipy_vertex_aug_seed_triples'), 'guard_seeds_uv': topo.get('guard_seeds_uv')}
+        for key in ('node_trim_curve_piece', 'node_trim_curve_segment', 'node_trim_curve_fraction', 'node_trim_segment_uv'):
+            if key in topo:
+                out[key] = topo[key]
         out['original_seeds_uv'] = original_seeds_uv
         out['active_seed_ids'] = seed_active_ids
         out['seed_active_mask'] = seed_active_mask
@@ -1673,91 +1906,135 @@ class ContinuousVoronoiDecoder(nn.Module):
             out['vertices_xyz'] = torch.as_tensor(xyz, dtype=seeds_uv.dtype, device=seeds_uv.device)
         return out
 
-    def evaluate_at_uv(
-        self,
-        points_uv: torch.Tensor,
-        Xu: torch.Tensor | None=None,
-        Xv: torch.Tensor | None=None,
-        points_3d: torch.Tensor | None=None,
-        points_xyz: torch.Tensor | None=None,
-        tau: float | torch.Tensor | None=None,
-        seeds_raw: torch.Tensor | None=None,
-        w_raw: torch.Tensor | None=None,
-        cad_domain: Any | None=None,
-        u_periodic: bool | None=None,
-        v_periodic: bool | None=None,
-        **_: Any,
-    ) -> dict[str, Any]:
-        if seeds_raw is None:
-            raise ValueError('seeds_raw must be provided for swept tube evaluation.')
-        if w_raw is None:
-            raise ValueError('w_raw must be provided for swept tube evaluation.')
-        if points_3d is None:
-            points_3d = points_xyz
-        if points_3d is None:
-            raise ValueError('points_3d must be provided for swept tube evaluation.')
-        points_uv = torch.as_tensor(points_uv, dtype=seeds_raw.dtype, device=seeds_raw.device)
-        points_3d = torch.as_tensor(points_3d, dtype=seeds_raw.dtype, device=seeds_raw.device)
-        Xu_t = None if Xu is None else torch.as_tensor(Xu, dtype=seeds_raw.dtype, device=seeds_raw.device)
-        Xv_t = None if Xv is None else torch.as_tensor(Xv, dtype=seeds_raw.dtype, device=seeds_raw.device)
-        use_u_periodic = self._bool_value(self.face_u_periodic) if u_periodic is None else bool(u_periodic)
-        use_v_periodic = self._bool_value(self.face_v_periodic) if v_periodic is None else bool(v_periodic)
-        return self.build_swept_tube_fields(
-            points_uv=points_uv,
-            points_3d=points_3d,
-            seeds_uv=seeds_raw,
-            w_raw=w_raw,
-            Xu=Xu_t,
-            Xv=Xv_t,
-            cad_domain=cad_domain,
-            u_periodic=use_u_periodic,
-            v_periodic=use_v_periodic,
-            return_xyz=True,
-        )
-
     def forward(
         self,
         seeds_uv: torch.Tensor | None=None,
-        seed_activity: torch.Tensor | None=None,
-        cad_domain: Any | None=None,
-        u_periodic: bool | None=None,
-        v_periodic: bool | None=None,
-        return_xyz: bool | None=None,
-        debug_compare_scipy: bool=False,
-        keep_isolated_vertices: bool=False,
-        points_uv: torch.Tensor | None=None,
-        Xu: torch.Tensor | None=None,
-        Xv: torch.Tensor | None=None,
-        points_3d: torch.Tensor | None=None,
-        points_xyz: torch.Tensor | None=None,
-        tau: float | torch.Tensor | None=None,
-        seeds_raw: torch.Tensor | None=None,
         w_raw: torch.Tensor | None=None,
-        **kwargs: Any,
+        generate_density_fiber : bool=True,
     ) -> dict[str, Any]:
-        if points_uv is not None or seeds_raw is not None or w_raw is not None:
-            return self.evaluate_at_uv(
-                points_uv=points_uv,
-                Xu=Xu,
-                Xv=Xv,
-                points_3d=points_3d if points_3d is not None else points_xyz,
-                tau=tau,
-                seeds_raw=seeds_raw if seeds_raw is not None else seeds_uv,
-                w_raw=w_raw,
+            if seeds_uv is None:
+                raise ValueError('seeds_raw must be provided.')
+            if w_raw is None:
+                raise ValueError('w_raw must be provided.')
+            if self.points_3d is None:
+                raise ValueError('points_3d for mesh must be provided.')
+            points_uv = torch.as_tensor(self.points_uv, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            points_3d = torch.as_tensor(self.points_3d, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            Xu = None if self.Xu is None else torch.as_tensor(self.Xu, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            Xv = None if self.Xv is None else torch.as_tensor(self.Xv, dtype=seeds_uv.dtype, device=seeds_uv.device)
+            use_u_periodic = self._bool_value(self.face_u_periodic)
+            use_v_periodic = self._bool_value(self.face_v_periodic)
+            cad_domain =self.Cad_domain
+            topo_out = self.forward_scipy_topology(
+                seeds_uv=seeds_uv,
                 cad_domain=cad_domain,
-                u_periodic=u_periodic,
-                v_periodic=v_periodic,
-                **kwargs,
+                u_periodic=use_u_periodic,
+                v_periodic=use_v_periodic,
+                return_xyz=self.return_xyz,
+                keep_isolated_vertices=False,
             )
-        if not isinstance(seeds_uv, torch.Tensor):
-            raise TypeError('seeds_uv must be a torch.Tensor.')
-        if seeds_uv.ndim != 2 or seeds_uv.shape[-1] != 2:
-            raise ValueError(f'seeds_uv must have shape [S, 2], got {tuple(seeds_uv.shape)}.')
-        if not seeds_uv.is_floating_point():
-            raise TypeError('seeds_uv must be a floating point tensor.')
-        use_u_periodic = self._bool_value(self.face_u_periodic) if u_periodic is None else bool(u_periodic)
-        use_v_periodic = self._bool_value(self.face_v_periodic) if v_periodic is None else bool(v_periodic)
-        return self.forward_scipy_topology(seeds_uv=seeds_uv, cad_domain=cad_domain, u_periodic=use_u_periodic, v_periodic=use_v_periodic, return_xyz=return_xyz, keep_isolated_vertices=keep_isolated_vertices)
+            w_geo = self.width(w_raw, seeds=seeds_uv)
+            width_uv = self._pair_upper_mean(w_geo)
+            local_scale = self._local_uv_to_xyz_scale(Xu, Xv, points_3d)
+            radius_3d = (width_uv * local_scale).clamp_min(0.0)
+            tau_distance = max(float(self.tube_distance_tau), self.eps) * local_scale.clamp_min(self.eps)
+            tau_density = max(float(self.tube_density_tau), self.eps) * local_scale.clamp_min(self.eps)
+            tau_fiber = max(float(self.tube_fiber_tau), self.eps) * local_scale.clamp_min(self.eps)
+            min_tube_samples = max(int(self.tube_curve_samples), 2)
+            curves_uv = topo_out.get('edge_curves_uv')
+            if curves_uv is None:
+                curves_uv = points_uv.new_empty((0, min_tube_samples, 2))
+            topology_seeds_uv = topo_out.get('topology_seeds_uv', seeds_uv)
+            use_torch_cad = cad_domain is not None and callable(getattr(cad_domain, 'eval_uv_norm_batch_torch', None))
+            if curves_uv.shape[0] > 0:
+                if curves_uv.shape[1] != min_tube_samples:
+                    curves_uv = self.sample_graph_edge_curves_uv(
+                        seeds_uv=topology_seeds_uv,
+                        graph=topo_out['graph'],
+                        n_samples=min_tube_samples,
+                        u_periodic=use_u_periodic,
+                        v_periodic=use_v_periodic,
+                    )
+                if use_torch_cad:
+                    coarse_curves_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv)
+                else:
+                    coarse_curves_xyz = self.soft_lift_uv_to_xyz(
+                        curves_uv,
+                        points_uv,
+                        points_3d,
+                        u_periodic=use_u_periodic,
+                        v_periodic=use_v_periodic,
+                    )
+                target_spacing = torch.maximum(
+                    float(self.tube_target_spacing_ratio) * radius_3d,
+                    points_3d.new_tensor(max(float(self.min_tube_spacing), self.eps)),
+                )
+                tube_samples = self.adaptive_sample_count_from_curves(
+                    coarse_curves_xyz,
+                    min_samples=min_tube_samples,
+                    target_spacing=target_spacing,
+                )
+                if tube_samples != curves_uv.shape[1]:
+                    curves_uv = self.sample_graph_edge_curves_uv(
+                        seeds_uv=topology_seeds_uv,
+                        graph=topo_out['graph'],
+                        n_samples=tube_samples,
+                        u_periodic=use_u_periodic,
+                        v_periodic=use_v_periodic,
+                    )
+                    curves_xyz = (
+                        self.sample_smooth_edge_curves_xyz(cad_domain, curves_uv)
+                        if use_torch_cad else
+                        self.soft_lift_uv_to_xyz(curves_uv, points_uv, points_3d, u_periodic=use_u_periodic, v_periodic=use_v_periodic)
+                    )
+                else:
+                    curves_xyz = coarse_curves_xyz
+            else:
+                curves_xyz = points_3d.new_empty((0, min_tube_samples, 3))
+
+            if use_torch_cad:
+                seeds_xyz = self.sample_smooth_edge_curves_xyz(cad_domain, seeds_uv.reshape(-1, 1, 2)).reshape(-1, 3)
+            else:
+                seeds_xyz = self.soft_lift_uv_to_xyz(
+                    seeds_uv,
+                    points_uv,
+                    points_3d,
+                    u_periodic=use_u_periodic,
+                    v_periodic=use_v_periodic,
+                )
+            if curves_xyz.shape[0] == 0 or not generate_density_fiber:
+                rho = points_3d.new_zeros((points_3d.shape[0],))
+                fallback = points_3d.new_tensor([1.0, 0.0, 0.0]).expand(points_3d.shape[0], 3)
+                if Xu is not None:
+                    fallback = F.normalize(Xu.to(dtype=points_3d.dtype, device=points_3d.device), dim=-1, eps=self.eps)
+                field = {'density': rho, 'fiber': fallback, 'distance': points_3d.new_full((points_3d.shape[0],), float('inf'))}
+            else:
+                field = self.soft_tube_density_and_fiber_to_elements(
+                    elem_centers_xyz=points_3d,
+                    curves_xyz=curves_xyz,
+                    radius=radius_3d,
+                    tau_distance=float(tau_distance.detach().item()),
+                    tau_density=float(tau_density.detach().item()),
+                    tau_fiber=float(tau_fiber.detach().item()),
+                    rho_min=float(self.rho_min),
+                    fallback_fiber=Xu,
+                )
+            out = dict(topo_out)
+
+            out.update({
+                'seeds': seeds_uv,
+                'seeds_uv': seeds_uv,
+                'seeds_xyz': seeds_xyz,
+                'rho': field['density'],
+                'density': field['density'],
+                'fiber3d': field['fiber'],
+                'tube_distance': field['distance'],
+                'w_geo': w_geo,
+                'centerline_radius': radius_3d,
+                'edge_curves_uv': curves_uv,
+                'edge_curves_xyz': curves_xyz,
+            })
+            return out
 
     def exact_vertex_degree(self, num_vertices, edge_index, dtype, device):
         degree = torch.zeros(num_vertices, dtype=dtype, device=device)

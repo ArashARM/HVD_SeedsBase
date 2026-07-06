@@ -86,6 +86,7 @@ def compute_w_min_from_min_feature_size_3d(
 @dataclass
 class TrainingConfig:
     seed_init_fps_seed: int | None = None
+    use_balanced_seed_init: bool = True
     seed_number: int = 15
     training_face_index: int = 0
     LoadingCasee: str = "Unspecified loading case"
@@ -109,7 +110,28 @@ class TrainingConfig:
     centerline_softmin_tau: float = 0.01
     tube_curve_samples: int = 64
     tube_lift_tau: float = 0.02
+    tube_lift_max_values: int = 4_000_000
     rho_min: float = 0.0
+    decoder_eps: float = 1e-8
+    decoder_solve_reg: float = 1e-6
+    decoder_tau_voronoi: float = 0.01
+    decoder_tau_box: float = 0.01
+    decoder_tau_trim: float = 0.01
+    decoder_use_trim_activity: bool = True
+    decoder_return_xyz: bool = True
+    decoder_vertex_boundary_margin: float = 0.02
+    decoder_edge_trim_samples: int = 32
+    decoder_edge_trim_reduction: str = "softmin"
+    decoder_edge_trim_reduce_tau: float = 0.05
+    decoder_use_edge_trim_gate: bool = True
+    decoder_nearest_segment_k: int = 4
+    decoder_use_segment_distance: bool = True
+    decoder_use_spatial_pruning: bool = True
+    decoder_min_tube_spacing: float = 1e-3
+    decoder_tube_target_spacing_ratio: float = 0.75
+    decoder_use_seed_activation: bool = True
+    decoder_duplicate_merge_sigma: float = 1e-4
+    decoder_duplicate_effect_temp_ratio: float = 0.25
 
     use_3d_density_filter: bool = False
     filter_radius_3d: float = 0.03
@@ -119,6 +141,7 @@ class TrainingConfig:
     filter_projection_eta: float = 0.5
     visualize_filtered_density: bool = True
     visualize_raw_density: bool = False
+    generate_decoder_density_fiber: bool = True
 
     lam_fem: float = 1.0
     lam_vol: float = 2.0
@@ -126,6 +149,17 @@ class TrainingConfig:
     lam_bnd: float = 0.5
     lam_vol_effective: float = 0.5
     effective_volume_power: float = 2.0
+    lam_curve_length: float = 1.0
+    curve_length_target: float | None = None
+    curve_length_loss_type: str = "pairwise"
+    curve_length_eps: float = 1e-8
+    curve_length_tolerance: float = 0.15
+    curve_length_outlier_weight: float = 1.0
+    lam_cell_edge_uniform: float = 1.0
+    lam_cell_angle_uniform: float = 1.0
+    lam_cell_radial_uniform: float = 0.5
+    cell_edge_uniform_eps: float = 1e-8
+    cell_angle_uniform_eps: float = 1e-8
 
     comp_normalize_by: float | None = 1e10
     normalize_losses: bool = True
@@ -202,6 +236,9 @@ class TrainingConfig:
 
     timelapse_frame_step: int = 20
     TM_laps_Thr: float = 0.45
+    timelapse_show_3d_tubes: bool = True
+    timelapse_tube_radius_scale: float = 1.0
+    timelapse_tube_n_sides: int = 12
 
     def __post_init__(self):
         self.training_face_index = int(self.training_face_index)
@@ -236,6 +273,10 @@ class TrainingConfig:
             raise ValueError(f"tube_curve_samples must be >= 2, got {self.tube_curve_samples}")
         if self.tube_lift_tau <= 0.0:
             raise ValueError(f"tube_lift_tau must be > 0, got {self.tube_lift_tau}")
+        if self.tube_lift_max_values < 1:
+            raise ValueError(
+                f"tube_lift_max_values must be >= 1, got {self.tube_lift_max_values}"
+            )
         if not (0.0 <= self.rho_min < 1.0):
             raise ValueError(f"rho_min must satisfy 0 <= rho_min < 1, got {self.rho_min}")
         if not (0.0 < self.filter_projection_eta < 1.0):
@@ -328,6 +369,7 @@ class TrainingConfig:
                 raise ValueError(
                     f"min_feature_size_3d must be > 0, got {self.min_feature_size_3d}"
                 )
+        self.use_balanced_seed_init = bool(self.use_balanced_seed_init)
 
 
 def _cfg_value(config, name: str, default=None):
@@ -733,28 +775,20 @@ class OptimizedShellFunction:
         with torch.no_grad():
             # Raw arbitrary-point evaluation: graph density postprocess needs a
             # full mesh/face tensor and is applied by evaluate_face().
-            return self.decoder.evaluate_at_uv(
+            use_u_periodic = self.decoder._bool_value(getattr(self.decoder, "face_u_periodic", False))
+            use_v_periodic = self.decoder._bool_value(getattr(self.decoder, "face_v_periodic", False))
+            return self.decoder.build_swept_tube_fields(
                 points_uv=points_uv,
+                points_3d=points_xyz,
+                seeds_uv=pred["seeds_raw"],
+                w_raw=pred["w_raw"],
                 Xu=Xu,
                 Xv=Xv,
-                points_3d=points_xyz,
-                tau=tau,
-                seeds_raw=pred["seeds_raw"],
-                w_raw=pred["w_raw"],
-                h_raw=pred.get("h_raw", None),
-                theta=pred.get("theta", None),
-                a_raw=pred.get("a_raw", None),
-                points_face_id=points_face_id,
-                boundary_uv=boundary_uv,
-                boundary_face_id=boundary_face_id,
-                boundary_width_raw=pred.get("boundary_width_raw", None),
-                boundary_alpha_raw=pred.get("boundary_alpha_raw", None),
-                boundary_beta_raw=pred.get("boundary_beta_raw", None),
-                centerline_radius_raw=_centerline_radius_raw_from_w(self.config, pred["w_raw"]),
-                hard_seed_mask=hard_seed_mask,
-                seed_domain_mask=seed_domain_mask,
-                seed_domain_mask_threshold=float(self.config.get("seed_domain_mask_threshold", 0.5)),
-                seed_domain_temp=float(self.config.get("seed_domain_temp", 0.05)),
+                cad_domain=getattr(self.decoder, "Cad_domain", None),
+                u_periodic=use_u_periodic,
+                v_periodic=use_v_periodic,
+                return_xyz=True,
+                generate_density_fiber=bool(self.config.get("generate_decoder_density_fiber", True)),
             )
 
     def evaluate_face(self, face_tensor, hard_seed_mask=True):
@@ -1286,6 +1320,9 @@ class NN_Trainer:
         shell_problem,
         config: TrainingConfig,
         loading_img=None,
+        Cad_domain=None,
+        cad_domain=None,
+        face_mesh=None,
     ):
         self.generator = generator
         self.viz = viz
@@ -1294,6 +1331,10 @@ class NN_Trainer:
         self.fem = fem
         self.shell_problem = shell_problem
         self.cfg = config
+        self.Cad_domain = Cad_domain if Cad_domain is not None else cad_domain
+        if self.Cad_domain is None:
+            self.Cad_domain = generator
+        self.face_mesh = face_mesh
 
         self.last_fem_debug = {}
         self.fem_debug_history = []
@@ -1308,6 +1349,280 @@ class NN_Trainer:
         self.writer = None
         self.tensorboard_log_dir = None
         self._init_tensorboard()
+
+    def curve_3d_edge_lengths(self, decoder_out):
+        curves = decoder_out.get("edge_curves_xyz", None)
+        if curves is None:
+            for value in decoder_out.values():
+                if torch.is_tensor(value):
+                    return value.new_empty((0,))
+            try:
+                device = next(self.ppnet_cls.parameters()).device
+            except Exception:
+                device = getattr(self, "device", torch.device("cpu"))
+            return torch.empty((0,), device=device)
+
+        if curves.ndim != 3 or curves.shape[0] == 0 or curves.shape[1] < 2:
+            return curves.new_empty((0,))
+
+        seg = curves[:, 1:, :] - curves[:, :-1, :]
+        edge_len = torch.linalg.norm(seg, dim=-1).sum(dim=-1)
+        return edge_len[torch.isfinite(edge_len)]
+
+    def curve_length_similarity_loss(self, decoder_out):
+        """
+        Differentiable loss that encourages all generated 3D edge curves
+        to have similar lengths.
+
+        Uses decoder_out["edge_curves_xyz"] with shape [E, K, 3].
+        """
+        cfg = self.cfg
+        edge_len = self.curve_3d_edge_lengths(decoder_out)
+        if edge_len.numel() <= 1:
+            return edge_len.new_zeros(())
+
+        eps = float(getattr(cfg, "curve_length_eps", 1e-8))
+        mean_len = edge_len.mean().clamp_min(eps)
+        loss_type = str(getattr(cfg, "curve_length_loss_type", "cv")).lower()
+
+        if loss_type == "target" and getattr(cfg, "curve_length_target", None) is not None:
+            target = torch.as_tensor(
+                float(cfg.curve_length_target),
+                dtype=edge_len.dtype,
+                device=edge_len.device,
+            )
+            return ((edge_len - target) / target.clamp_min(eps)).pow(2).mean()
+
+        if loss_type == "var":
+            return ((edge_len - mean_len) / mean_len).pow(2).mean()
+        if loss_type == "pairwise":
+            diff = edge_len[:, None] - edge_len[None, :]
+            denom = mean_len.pow(2).clamp_min(eps)
+            return diff.pow(2).mean() / denom
+        
+        if loss_type == "pairwise_smooth_l1":
+            diff = edge_len[:, None] - edge_len[None, :]
+            return torch.sqrt(diff.pow(2) + eps).mean() / mean_len
+        
+        if loss_type == "range_cv":
+            cv = edge_len.var(unbiased=False) / mean_len.pow(2).clamp_min(eps)
+            rel_range = (edge_len.max() - edge_len.min()) / mean_len
+            return cv + 5.0*rel_range.pow(2)
+        
+        if loss_type == "log_tolerance":
+            ratio = edge_len / mean_len
+            log_ratio = torch.log(ratio.clamp_min(eps))
+            tol = float(getattr(cfg, "curve_length_tolerance", 0.15))
+            excess = torch.relu(log_ratio.abs() - tol)
+            return excess.pow(2).mean()
+
+        if loss_type == "log_tolerance_max":
+            ratio = edge_len / mean_len
+            log_ratio = torch.log(ratio.clamp_min(eps))
+            tol = float(getattr(cfg, "curve_length_tolerance", 0.15))
+            excess = torch.relu(log_ratio.abs() - tol)
+            outlier_weight = float(getattr(cfg, "curve_length_outlier_weight", 1.0))
+            return excess.pow(2).mean() + outlier_weight * excess.max().pow(2)
+
+        return edge_len.var(unbiased=False) / mean_len.pow(2)
+    
+
+    
+    
+
+    def cell_edge_uniformity_loss(self, decoder_out):
+        """
+        Penalize per-cell irregularity without forcing all cells to one size.
+
+        Uses decoder_out["edge_curves_xyz"] with shape [E, K, 3] and
+        decoder_out["graph"]["edge_seed_pair"] with shape [E, 2]. Each graph
+        edge contributes to both cells in its seed pair.
+        """
+        cfg = self.cfg
+        curves = decoder_out.get("edge_curves_xyz", None)
+        graph = decoder_out.get("graph", None)
+        if curves is None or not isinstance(graph, dict):
+            for value in decoder_out.values():
+                if torch.is_tensor(value):
+                    return value.new_zeros(())
+            try:
+                device = next(self.ppnet_cls.parameters()).device
+            except Exception:
+                device = getattr(self, "device", torch.device("cpu"))
+            return torch.zeros((), device=device)
+
+        pairs = graph.get("edge_seed_pair", None)
+        if pairs is None:
+            return curves.new_zeros(())
+        if curves.ndim != 3 or curves.shape[0] == 0 or curves.shape[1] < 2:
+            return curves.new_zeros(())
+        if pairs.ndim != 2 or pairs.shape != (curves.shape[0], 2):
+            return curves.new_zeros(())
+
+        seg = curves[:, 1:, :] - curves[:, :-1, :]
+        edge_len = torch.linalg.norm(seg, dim=-1).sum(dim=-1)
+        pairs = pairs.to(device=edge_len.device)
+        finite_edges = torch.isfinite(edge_len)
+        valid_pairs = pairs >= 0
+        valid_edge = finite_edges & valid_pairs.any(dim=1)
+        if not bool(valid_edge.any().detach().cpu().item()):
+            return curves.new_zeros(())
+
+        edge_alpha = graph.get("edge_alpha", None)
+        if torch.is_tensor(edge_alpha) and edge_alpha.shape == edge_len.shape:
+            edge_weight = edge_alpha.to(dtype=edge_len.dtype, device=edge_len.device).clamp_min(0.0)
+        else:
+            edge_weight = torch.ones_like(edge_len)
+
+        eps = float(getattr(cfg, "cell_edge_uniform_eps", 1e-8))
+        angle_eps = float(getattr(cfg, "cell_angle_uniform_eps", 1e-8))
+        lam_angle = float(getattr(cfg, "lam_cell_angle_uniform", 1.0))
+        lam_radial = float(getattr(cfg, "lam_cell_radial_uniform", 0.5))
+        edge_start = curves[:, 0, :]
+        edge_end = curves[:, -1, :]
+        cell_ids = torch.unique(pairs[valid_edge & valid_pairs.any(dim=1)])
+        cell_ids = cell_ids[cell_ids >= 0]
+        losses = []
+
+        def unique_endpoint_indices(points: torch.Tensor) -> torch.Tensor:
+            rounded = torch.round(points.detach().cpu() / max(eps, 1e-12)).to(torch.long)
+            seen = {}
+            keep = []
+            for idx, key_t in enumerate(rounded):
+                key = tuple(int(v) for v in key_t.tolist())
+                if key not in seen:
+                    seen[key] = idx
+                    keep.append(idx)
+            return torch.as_tensor(keep, dtype=torch.long, device=points.device)
+
+        def polygon_vertices_for_cell(edge_ids: torch.Tensor) -> torch.Tensor | None:
+            endpoints = torch.cat((edge_start[edge_ids], edge_end[edge_ids]), dim=0)
+            finite_points = torch.isfinite(endpoints).all(dim=1)
+            endpoints = endpoints[finite_points]
+            if endpoints.shape[0] < 3:
+                return None
+
+            keep = unique_endpoint_indices(endpoints)
+            vertices = endpoints.index_select(0, keep)
+            if vertices.shape[0] < 3:
+                return None
+            return vertices
+
+        def ordered_vertices_for_cell(vertices: torch.Tensor) -> torch.Tensor | None:
+            if vertices is None or vertices.shape[0] < 3:
+                return None
+
+            center_det = vertices.detach().mean(dim=0)
+            rel_det = vertices.detach() - center_det
+            if not bool((torch.linalg.vector_norm(rel_det, dim=1) > eps).all().detach().cpu().item()):
+                return None
+
+            try:
+                _u, _s, vh = torch.linalg.svd(rel_det, full_matrices=False)
+                basis_x = vh[0]
+                basis_y = vh[1] if vh.shape[0] > 1 else rel_det.new_tensor([0.0, 1.0, 0.0])
+            except Exception:
+                basis_x = rel_det[0] / torch.linalg.vector_norm(rel_det[0]).clamp_min(eps)
+                trial = rel_det[1]
+                basis_y = trial - (trial * basis_x).sum() * basis_x
+                basis_y = basis_y / torch.linalg.vector_norm(basis_y).clamp_min(eps)
+
+            x = rel_det @ basis_x
+            y = rel_det @ basis_y
+            if not bool((torch.isfinite(x).all() & torch.isfinite(y).all()).detach().cpu().item()):
+                return None
+            order = torch.argsort(torch.atan2(y, x))
+            return vertices.index_select(0, order.to(device=vertices.device))
+
+        def polygon_angle_loss(vertices: torch.Tensor) -> torch.Tensor | None:
+            if vertices is None or vertices.shape[0] < 3:
+                return None
+            prev_v = torch.roll(vertices, shifts=1, dims=0)
+            next_v = torch.roll(vertices, shifts=-1, dims=0)
+            a = prev_v - vertices
+            b = next_v - vertices
+            a_norm = torch.linalg.vector_norm(a, dim=1)
+            b_norm = torch.linalg.vector_norm(b, dim=1)
+            valid = (a_norm > angle_eps) & (b_norm > angle_eps)
+            if int(valid.detach().sum().cpu().item()) < 3:
+                return None
+            cos_angle = (a[valid] * b[valid]).sum(dim=1) / (
+                a_norm[valid] * b_norm[valid]
+            ).clamp_min(angle_eps)
+            angles = torch.acos(cos_angle.clamp(-1.0 + 1e-6, 1.0 - 1e-6))
+            mean_angle = angles.mean().clamp_min(angle_eps)
+            return angles.var(unbiased=False) / mean_angle.pow(2)
+
+        def polygon_radial_loss(vertices: torch.Tensor) -> torch.Tensor | None:
+            if vertices is None or vertices.shape[0] < 3:
+                return None
+            center = vertices.mean(dim=0)
+            radial = torch.linalg.vector_norm(vertices - center, dim=1)
+            finite_radial = torch.isfinite(radial) & (radial > eps)
+            if int(finite_radial.detach().sum().cpu().item()) < 3:
+                return None
+            radial = radial[finite_radial]
+            mean_radial = radial.mean().clamp_min(eps)
+            return radial.var(unbiased=False) / mean_radial.pow(2)
+
+        for cell_id in cell_ids.detach().cpu().tolist():
+            belongs = valid_edge & (pairs == int(cell_id)).any(dim=1)
+            if int(belongs.sum().detach().cpu().item()) <= 1:
+                continue
+            edge_ids = torch.nonzero(belongs, as_tuple=False).flatten()
+
+            lengths = edge_len[belongs]
+            weights = edge_weight[belongs]
+            finite = torch.isfinite(lengths) & torch.isfinite(weights) & (weights > 0.0)
+            if int(finite.sum().detach().cpu().item()) <= 1:
+                continue
+
+            lengths = lengths[finite]
+            weights = weights[finite]
+            weight_sum = weights.sum().clamp_min(eps)
+            mean_len = (weights * lengths).sum() / weight_sum
+            mean_len = mean_len.clamp_min(eps)
+            var_len = (weights * (lengths - mean_len).pow(2)).sum() / weight_sum
+            cell_loss = var_len / mean_len.pow(2)
+
+            cell_vertices = polygon_vertices_for_cell(edge_ids)
+            ordered_vertices = ordered_vertices_for_cell(cell_vertices)
+            angle_loss = polygon_angle_loss(ordered_vertices)
+            if angle_loss is not None:
+                cell_loss = cell_loss + lam_angle * angle_loss
+            elif lam_radial != 0.0:
+                radial_loss = polygon_radial_loss(cell_vertices)
+                if radial_loss is not None:
+                    cell_loss = cell_loss + lam_radial * radial_loss
+
+            losses.append(cell_loss)
+
+        if not losses:
+            return curves.new_zeros(())
+        return torch.stack(losses).mean()
+
+    def neutral_density_fiber_fields(self, uv: torch.Tensor, Xu: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        rho = torch.zeros((uv.shape[0],), dtype=uv.dtype, device=uv.device)
+        if Xu is not None:
+            fiber = Xu.to(device=uv.device, dtype=uv.dtype)
+            if fiber.ndim != 2 or fiber.shape != (uv.shape[0], 3):
+                fiber = None
+        else:
+            fiber = None
+        if fiber is None:
+            fiber = uv.new_tensor([1.0, 0.0, 0.0]).expand(uv.shape[0], 3)
+        fiber = fiber / torch.linalg.norm(fiber, dim=-1, keepdim=True).clamp_min(self.cfg.eps)
+        stats = {
+            "filter_delta_mean": 0.0,
+            "filter_delta_max": 0.0,
+            "projection_delta_mean": 0.0,
+            "projection_delta_max": 0.0,
+            "raw_mean": 0.0,
+            "filtered_mean": 0.0,
+            "projected_mean": 0.0,
+            "final_mean": 0.0,
+        }
+        return rho, fiber, stats
 
     # ------------------------------------------------------------------
     # TensorBoard
@@ -1504,6 +1819,8 @@ class NN_Trainer:
         self._tb_add_scalar("Loss/Volume", row["loss_vol"], step)
         self._tb_add_scalar("Loss/Repulsion", row["loss_rep"], step)
         self._tb_add_scalar("Loss/Boundary", row["loss_bnd"], step)
+        self._tb_add_scalar("Loss/CurveLength", row["loss_curve_length"], step)
+        self._tb_add_scalar("Loss/CellEdgeUniform", row["loss_cell_edge_uniform"], step)
         self._tb_add_scalar("Loss/FEM", row["loss_fem"], step)
         self._tb_add_scalar("Loss/Compliance", row["loss_comp"], step)
 
@@ -1953,6 +2270,7 @@ class NN_Trainer:
         u_periodic,
         v_periodic,
         boundary_solid_idx=None,
+        face_tensor=None,
     ):
         decoder = self.decoder_cls(
             **self._decoder_init_kwargs(
@@ -1961,6 +2279,7 @@ class NN_Trainer:
                 u_periodic=u_periodic,
                 v_periodic=v_periodic,
                 boundary_solid_idx=boundary_solid_idx,
+                face_tensor=face_tensor,
             )
         ).to(device)
 
@@ -1988,31 +2307,30 @@ class NN_Trainer:
 
         return decoder, ppnet
 
-    def _decoder_init_kwargs(self, device, seed_number, u_periodic, v_periodic, boundary_solid_idx=None):
-        face_u_periodic = torch.tensor([bool(u_periodic)], dtype=torch.bool, device=device)
-        face_v_periodic = torch.tensor([bool(v_periodic)], dtype=torch.bool, device=device)
-        seed_face_id = torch.zeros(seed_number, dtype=torch.long, device=device)
-        boundary_solid_idx = (
-            torch.empty(0, dtype=torch.long, device=device)
-            if boundary_solid_idx is None
-            else torch.as_tensor(boundary_solid_idx, dtype=torch.long, device=device)
-        )
+    def _decoder_face_mesh_for_face(self, face_tensor):
+        if self.face_mesh is None:
+            return face_tensor
+        if isinstance(self.face_mesh, dict) and "face_tensors" in self.face_mesh:
+            tensors = self.face_mesh["face_tensors"]
+            if isinstance(tensors, (list, tuple)):
+                return tensors[int(getattr(self.cfg, "training_face_index", 0))]
+            return tensors
+        if isinstance(self.face_mesh, (list, tuple)):
+            return self.face_mesh[int(getattr(self.cfg, "training_face_index", 0))]
+        return self.face_mesh
 
+    def _decoder_init_kwargs(self, device, seed_number, u_periodic, v_periodic, boundary_solid_idx=None, face_tensor=None):
         return {
-            "n_seeds": int(seed_number),
-            "seed_face_id": seed_face_id,
-            "boundary_solid_idx": boundary_solid_idx,
-            "face_u_periodic": face_u_periodic,
-            "face_v_periodic": face_v_periodic,
-            "w_min": self.cfg.w_min,
-            "w_max_ratio": self.cfg.w_max_ratio,
-            "beta": self.cfg.beta,
-            "raw_temp": self.cfg.decoder_raw_temp,
-            "centerline_beta": self.cfg.centerline_beta,
-            "centerline_softmin_tau": self.cfg.centerline_softmin_tau,
-            "tube_curve_samples": self.cfg.tube_curve_samples,
-            "tube_lift_tau": self.cfg.tube_lift_tau,
-            "rho_min": self.cfg.rho_min,
+            "Cad_domain": self.Cad_domain,
+            "face_mesh": self._decoder_face_mesh_for_face(face_tensor),
+            "return_xyz": True,
+            "tube_curve_samples": 64,
+            "edge_trim_samples": 32,
+            "tube_density_tau": 0.002,
+            "tube_fiber_tau": 0.002,
+            "face_u_periodic": bool(u_periodic),
+            "face_v_periodic": bool(v_periodic),
+            "duplicate_merge_sigma": self.cfg.decoder_duplicate_merge_sigma,
         }
 
     def _build_face_model(self, face_tensor, device):
@@ -2022,6 +2340,7 @@ class NN_Trainer:
             u_periodic=face_tensor.get("u_periodic", False),
             v_periodic=face_tensor.get("v_periodic", False),
             boundary_solid_idx=self._true_open_boundary_idx(face_tensor),
+            face_tensor=face_tensor,
         )
 
     def _save_optimized_shell_function(
@@ -2065,6 +2384,7 @@ class NN_Trainer:
                     seed_number=int(getattr(decoder, "n_seeds", self.cfg.seed_number)),
                     u_periodic=face_tensor.get("u_periodic", False),
                     v_periodic=face_tensor.get("v_periodic", False),
+                    face_tensor=face_tensor,
                 )
             ),
             "decoder_state_dict": _cpu_detached_tree(decoder.state_dict()),
@@ -2191,15 +2511,16 @@ class NN_Trainer:
         return True, uv_anchor_pruned, old_count, old_count - new_count
 
     @staticmethod
-    def _decoder_seed_state_for_pred(decoder, pred_i: dict, device) -> tuple[int, torch.Tensor]:
-        old_n_seeds = int(getattr(decoder, "n_seeds", pred_i["seeds_raw"].shape[0]))
+    def _decoder_seed_state_for_pred(decoder, pred_i: dict, device) -> tuple[int | None, torch.Tensor | None]:
+        old_n_seeds_raw = getattr(decoder, "n_seeds", None)
+        old_n_seeds = None if old_n_seeds_raw is None else int(old_n_seeds_raw)
         old_seed_face_id = (
             decoder.seed_face_id.detach().clone()
             if hasattr(decoder, "seed_face_id")
             else None
         )
         pred_seed_count = int(pred_i["seeds_raw"].shape[0])
-        if pred_seed_count != old_n_seeds:
+        if old_n_seeds is None or pred_seed_count != old_n_seeds:
             decoder.n_seeds = pred_seed_count
             if old_seed_face_id is not None:
                 decoder.seed_face_id = torch.zeros(
@@ -2210,9 +2531,9 @@ class NN_Trainer:
         return old_n_seeds, old_seed_face_id
 
     @staticmethod
-    def _restore_decoder_seed_state(decoder, state: tuple[int, torch.Tensor]):
+    def _restore_decoder_seed_state(decoder, state: tuple[int | None, torch.Tensor | None]):
         old_n_seeds, old_seed_face_id = state
-        decoder.n_seeds = int(old_n_seeds)
+        decoder.n_seeds = None if old_n_seeds is None else int(old_n_seeds)
         if old_seed_face_id is not None:
             decoder.seed_face_id = old_seed_face_id
 
@@ -2243,6 +2564,16 @@ class NN_Trainer:
     def _init_face_seed(self, face_tensor):
         cfg = self.cfg
         boundary = self._true_open_boundary_idx(face_tensor)
+        if not cfg.use_balanced_seed_init:
+            seed_idx = self._random_seed_indices(
+                n_points=int(face_tensor["uv"].shape[0]),
+                n_samples=int(cfg.seed_number),
+                exclude_idx=boundary,
+                seed=cfg.seed_init_fps_seed,
+                device=face_tensor["uv"].device,
+            )
+            return face_tensor["uv"][seed_idx].clone()
+
         seed_idx = self.generator.fps_3d(
             face_tensor["points_xyz"],
             cfg.seed_number,
@@ -2250,6 +2581,41 @@ class NN_Trainer:
             seed = cfg.seed_init_fps_seed,
         )
         return face_tensor["uv"][seed_idx].clone()
+
+    @staticmethod
+    def _random_seed_indices(
+        n_points: int,
+        n_samples: int,
+        exclude_idx=None,
+        seed: int | None = None,
+        device=None,
+    ) -> torch.Tensor:
+        device = torch.device("cpu") if device is None else torch.device(device)
+        n_points = int(n_points)
+        n_samples = min(int(n_samples), n_points)
+        if n_samples <= 0 or n_points <= 0:
+            return torch.empty((0,), dtype=torch.long, device=device)
+
+        candidate_mask = torch.ones((n_points,), dtype=torch.bool, device=device)
+        if exclude_idx is not None:
+            exclude_idx = torch.as_tensor(exclude_idx, dtype=torch.long, device=device)
+            exclude_idx = exclude_idx[(exclude_idx >= 0) & (exclude_idx < n_points)]
+            if exclude_idx.numel() > 0:
+                candidate_mask[exclude_idx] = False
+
+        candidates = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+        if candidates.numel() == 0:
+            candidates = torch.arange(n_points, dtype=torch.long, device=device)
+        n_samples = min(n_samples, int(candidates.numel()))
+
+        if seed is None:
+            order = torch.randperm(candidates.numel(), device=device)
+        else:
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(seed))
+            order_cpu = torch.randperm(candidates.numel(), generator=gen)
+            order = order_cpu.to(device=device)
+        return candidates[order[:n_samples]].to(dtype=torch.long)
 
     def _seed_points_xyz(self, seeds, face_tensor):
         return self.generator.seeds_uv_to_xyz_nearest(
@@ -2271,6 +2637,13 @@ class NN_Trainer:
             for pn, p in module.named_parameters():
                 if p.requires_grad:
                     yield mi, pn, p
+
+    @classmethod
+    def _trainable_zero(cls, modules, dtype, device):
+        zero = torch.zeros((), dtype=dtype, device=device)
+        for _mi, _pn, p in cls._named_trainable_params(modules):
+            return p.reshape(-1)[0] * 0.0
+        return zero
 
     @classmethod
     def _nonfinite_grad_info(cls, modules):
@@ -2660,48 +3033,43 @@ class NN_Trainer:
         return cache
 
     def evaluate_cached_face_fields(self, render_cache, decoder, pred):
-        tau = self._fallback_tau_value() if pred.get("tau") is None else pred["tau"]
-        decoder_out = decoder.evaluate_at_uv(
-            points_uv=render_cache["uv_dense"],
-            Xu=render_cache["Xu_dense"],
-            Xv=render_cache["Xv_dense"],
-            points_3d=render_cache["xyz_dense"],
-            tau=tau,
-            seeds_raw=pred["seeds_raw"],
+        decoder_out = decoder(
+            seeds_uv=pred["seeds_raw"],
             w_raw=pred["w_raw"],
-            h_raw=pred.get("h_raw", None),
-            theta=pred.get("theta", None),
-            a_raw=pred.get("a_raw", None),
-            points_face_id=render_cache["local_face_id"],
-            boundary_uv=render_cache["boundary_uv"],
-            boundary_face_id=render_cache["boundary_face_id"],
-            boundary_width_raw=pred.get("boundary_width_raw", None),
-            boundary_alpha_raw=pred.get("boundary_alpha_raw", None),
-            boundary_beta_raw=pred.get("boundary_beta_raw", None),
-            centerline_radius_raw=_centerline_radius_raw_from_w(self.cfg, pred["w_raw"]),
-            hard_seed_mask=True,
-            seed_domain_mask=render_cache.get("seed_domain_mask", None),
-            seed_domain_mask_threshold=self.cfg.seed_domain_mask_threshold,
-            seed_domain_temp=self.cfg.seed_domain_temp,
+            generate_density_fiber=getattr(self.cfg, "generate_decoder_density_fiber", True),
         )
 
-        decoder_out = apply_density_postprocess_to_output(
-            decoder_out,
-            render_cache,
-            self.cfg,
-            return_debug=False,
-        )
+        if getattr(self.cfg, "generate_decoder_density_fiber", True):
+            decoder_out = apply_density_postprocess_to_output(
+                decoder_out,
+                render_cache,
+                self.cfg,
+                return_debug=False,
+            )
+            rho_dense = decoder_out["rho"]
+            rho_raw_decoder_dense = decoder_out["rho_raw_decoder"]
+            rho_postprocessed_dense = decoder_out["rho_postprocessed"]
+            fiber3d_dense = decoder_out["fiber3d"]
+        else:
+            rho_dense, fiber3d_dense, _ = self.neutral_density_fiber_fields(
+                render_cache["uv_dense"],
+                render_cache.get("Xu_dense", None),
+            )
+            rho_raw_decoder_dense = rho_dense
+            rho_postprocessed_dense = rho_dense
 
         return {
             "xyz_dense": render_cache["xyz_dense"],
-            "rho_dense": decoder_out["rho"],
-            "rho_raw_decoder_dense": decoder_out["rho_raw_decoder"],
-            "rho_postprocessed_dense": decoder_out["rho_postprocessed"],
-            "fiber3d_dense": decoder_out["fiber3d"],
+            "rho_dense": rho_dense,
+            "rho_raw_decoder_dense": rho_raw_decoder_dense,
+            "rho_postprocessed_dense": rho_postprocessed_dense,
+            "fiber3d_dense": fiber3d_dense,
             "seeds_uv": decoder_out.get("seeds_uv", decoder_out.get("seeds", None)),
+            "topology_seeds_uv": decoder_out.get("topology_seeds_uv", decoder_out.get("seeds_uv", decoder_out.get("seeds", None))),
             "seeds_xyz": decoder_out.get("seeds_xyz", None),
             "edge_curves_uv": decoder_out.get("edge_curves_uv", None),
             "edge_curves_xyz": decoder_out.get("edge_curves_xyz", None),
+            "graph": decoder_out.get("graph", None),
             "faces_ijk": render_cache["faces_ijk"],
         }
 
@@ -2939,6 +3307,36 @@ class NN_Trainer:
             row = NN_Trainer._resize_to_width(row, target_w)
         return NN_Trainer._pad_to_size(row, target_w=target_w, bg_color=bg_color)
 
+    @staticmethod
+    def _clip_segment_to_uv_box_np(p0, p1, tol=1e-12):
+        p0 = np.asarray(p0, dtype=np.float64)
+        p1 = np.asarray(p1, dtype=np.float64)
+        if p0.shape != (2,) or p1.shape != (2,) or not np.isfinite([*p0, *p1]).all():
+            return None
+        delta = p1 - p0
+        t_enter, t_exit = 0.0, 1.0
+        for p, q in (
+            (-delta[0], p0[0]),
+            (delta[0], 1.0 - p0[0]),
+            (-delta[1], p0[1]),
+            (delta[1], 1.0 - p0[1]),
+        ):
+            if abs(float(p)) <= tol:
+                if float(q) < -tol:
+                    return None
+                continue
+            ratio = float(q / p)
+            if p < 0.0:
+                t_enter = max(t_enter, ratio)
+            else:
+                t_exit = min(t_exit, ratio)
+            if t_enter > t_exit + tol:
+                return None
+        return (
+            np.clip(p0 + t_enter * delta, 0.0, 1.0),
+            np.clip(p0 + t_exit * delta, 0.0, 1.0),
+        )
+
     def _render_current_cad_frame_cached(
         self,
         seeds_list,
@@ -3044,7 +3442,9 @@ class NN_Trainer:
         show_seed_points = True
         show_axes_widget = True
 
-        first_face_density_img = None
+        first_face_voronoi_img = None
+        first_face_graph_img = None
+        first_face_core_curves_img = None
         if render_cache:
             first_cache = render_cache[0]
             first_face_id = first_cache["face_id"]
@@ -3058,12 +3458,31 @@ class NN_Trainer:
                 if self._face_id_key(ft.get("face_id", 0)) == first_face_id:
                     first_seed_idx = idx
                     break
-            first_face_density_img = self._render_first_face_density_2d(
+            first_face_voronoi_img = self._render_first_face_density_2d(
                 cache_i=first_cache,
                 out_i=first_out,
                 seeds_i=first_out.get("seeds_uv", seeds_list[first_seed_idx]),
                 pred_i=pred_by_face_id[first_face_id],
                 window_size=(1050, 1050),
+                show_scipy_voronoi=True,
+                show_core_curves=False,
+            )
+            first_face_graph_img = self._render_first_face_generated_graph_2d(
+                decoder=dec_by_face_id[first_face_id],
+                out_i=first_out,
+                seeds_i=first_out.get("seeds_uv", seeds_list[first_seed_idx]),
+                window_size=(1050, 1050),
+                show_node_ids=False,
+                show_edge_ids=False,
+            )
+            first_face_core_curves_img = self._render_first_face_density_2d(
+                cache_i=first_cache,
+                out_i=first_out,
+                seeds_i=first_out.get("seeds_uv", seeds_list[first_seed_idx]),
+                pred_i=pred_by_face_id[first_face_id],
+                window_size=(1050, 1050),
+                show_scipy_voronoi=False,
+                show_core_curves=True,
             )
 
         def make_plotter(title, mode, window_size):
@@ -3190,12 +3609,30 @@ class NN_Trainer:
             pl.close()
 
         bottom_imgs = []
-        if first_face_density_img is not None:
+        if first_face_voronoi_img is not None:
             bottom_imgs.append(
                 self._add_panel_border(
                     self._add_image_title(
-                        first_face_density_img,
-                        f"UV Seeds And Core Curves"
+                        first_face_voronoi_img,
+                        "Exact SciPy Voronoi"
+                        )
+                )
+            )
+        if first_face_graph_img is not None:
+            bottom_imgs.append(
+                self._add_panel_border(
+                    self._add_image_title(
+                        first_face_graph_img,
+                        "Connectivity Graph"
+                    )
+                )
+            )
+        if first_face_core_curves_img is not None:
+            bottom_imgs.append(
+                self._add_panel_border(
+                    self._add_image_title(
+                        first_face_core_curves_img,
+                        "Core Curves UV"
                         )
                 )
             )
@@ -3222,6 +3659,187 @@ class NN_Trainer:
         )
         return cad_panel
 
+    def _render_current_3d_tube_frame_cached(
+        self,
+        seeds_list,
+        decoders,
+        pred_list,
+        render_cache,
+        loading_img=None,
+    ):
+        import numpy as np
+        import pyvista as pv
+
+        tube_meshes = []
+        seed_meshes = []
+        first_face_voronoi_img = None
+        first_face_graph_img = None
+        first_face_core_curves_img = None
+
+        for face_i, (decoder, pred, cache) in enumerate(zip(decoders, pred_list, render_cache)):
+            fields = self.evaluate_cached_face_fields(cache, decoder, pred)
+
+            if first_face_voronoi_img is None:
+                first_face_voronoi_img = self._render_first_face_density_2d(
+                    cache_i=cache,
+                    out_i=fields,
+                    seeds_i=fields.get("seeds_uv", seeds_list[face_i]),
+                    pred_i=pred,
+                    window_size=(650, 650),
+                    show_scipy_voronoi=True,
+                    show_core_curves=False,
+                )
+                first_face_graph_img = self._render_first_face_generated_graph_2d(
+                    decoder=decoder,
+                    out_i=fields,
+                    seeds_i=fields.get("seeds_uv", seeds_list[face_i]),
+                    window_size=(650, 650),
+                    show_node_ids=False,
+                    show_edge_ids=False,
+                )
+                first_face_core_curves_img = self._render_first_face_density_2d(
+                    cache_i=cache,
+                    out_i=fields,
+                    seeds_i=fields.get("seeds_uv", seeds_list[face_i]),
+                    pred_i=pred,
+                    window_size=(650, 650),
+                    show_scipy_voronoi=False,
+                    show_core_curves=True,
+                )
+
+            curves = fields.get("edge_curves_xyz", None)
+            if curves is None:
+                continue
+
+            if torch.is_tensor(curves):
+                curves_np = curves.detach().cpu().numpy()
+            else:
+                curves_np = np.asarray(curves)
+
+            edge_colors = {
+                0: "black",
+                1: "orange",
+                2: "gray",
+                3: "orange",
+                4: "cyan",
+            }
+            edge_types_np = None
+            graph = fields.get("graph", None)
+            if isinstance(graph, dict):
+                edge_types = graph.get("edge_type", None)
+                if torch.is_tensor(edge_types):
+                    edge_types_np = edge_types.detach().cpu().numpy()
+                elif edge_types is not None:
+                    edge_types_np = np.asarray(edge_types)
+
+            radius = pred.get("centerline_radius", None)
+            if radius is None:
+                radius = 0.01
+            elif torch.is_tensor(radius):
+                radius = float(radius.detach().mean().cpu().item())
+            else:
+                radius = float(radius)
+
+            radius = max(
+                radius * float(getattr(self.cfg, "timelapse_tube_radius_scale", 1.0)),
+                1e-4,
+            )
+
+            for edge_id, points in enumerate(curves_np):
+                if points.shape[0] < 2 or not np.isfinite(points).all():
+                    continue
+
+                polyline = pv.PolyData(points.astype(np.float32))
+                polyline.lines = np.concatenate(
+                    ([len(points)], np.arange(len(points)))
+                ).astype(np.int64)
+
+                tube = polyline.tube(
+                    radius=radius,
+                    n_sides=int(getattr(self.cfg, "timelapse_tube_n_sides", 12)),
+                )
+                if tube.n_points > 0:
+                    if edge_types_np is not None and edge_id < len(edge_types_np):
+                        color = edge_colors.get(int(edge_types_np[edge_id]), "gray")
+                    else:
+                        color = "orange"
+                    tube_meshes.append((tube, color))
+
+            seeds_xyz = fields.get("seeds_xyz", None)
+            if seeds_xyz is not None:
+                if torch.is_tensor(seeds_xyz):
+                    seeds_xyz = seeds_xyz.detach().cpu().numpy()
+                seeds_xyz = np.asarray(seeds_xyz, dtype=np.float32)
+                if seeds_xyz.ndim == 2 and seeds_xyz.shape[0] > 0 and seeds_xyz.shape[1] == 3:
+                    finite_seed = np.isfinite(seeds_xyz).all(axis=1)
+                    if np.any(finite_seed):
+                        seed_mesh = pv.PolyData(seeds_xyz[finite_seed])
+                        if seed_mesh.n_points > 0:
+                            seed_meshes.append(seed_mesh)
+
+        plotter = pv.Plotter(off_screen=True, window_size=(900, 650))
+        plotter.set_background("white")
+
+        for mesh, color in tube_meshes:
+            if mesh.n_points > 0:
+                plotter.add_mesh(mesh, color=color, smooth_shading=True)
+
+        for sm in seed_meshes:
+            if sm.n_points > 0:
+                plotter.add_mesh(
+                    sm,
+                    color="red",
+                    point_size=8,
+                    render_points_as_spheres=True,
+                )
+
+        if not tube_meshes and not seed_meshes:
+            plotter.add_text("No 3D tube curves", color="black", font_size=14)
+
+        plotter.view_isometric()
+        plotter.reset_camera()
+        img = plotter.screenshot(return_img=True)
+        plotter.close()
+
+        tube_img = self._add_panel_border(
+            self._add_image_title(
+                self._composite_to_white(img),
+                "3D Voronoi Tube Curves",
+            )
+        )
+
+        if first_face_voronoi_img is None or first_face_graph_img is None or first_face_core_curves_img is None:
+            return tube_img
+
+        voronoi_img = self._add_panel_border(
+            self._add_image_title(
+                first_face_voronoi_img,
+                "Exact SciPy Voronoi",
+            )
+        )
+        graph_img = self._add_panel_border(
+            self._add_image_title(
+                first_face_graph_img,
+                "Connectivity Graph",
+            )
+        )
+        core_curves_img = self._add_panel_border(
+            self._add_image_title(
+                first_face_core_curves_img,
+                "Core Curves UV",
+            )
+        )
+        frame = self._stack_row_with_gaps([voronoi_img, graph_img, core_curves_img, tube_img], gap=22)
+        return cv2.copyMakeBorder(
+            frame,
+            16,
+            16,
+            16,
+            16,
+            borderType=cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        )
+
     def _render_first_face_density_2d(
         self,
         cache_i,
@@ -3229,11 +3847,19 @@ class NN_Trainer:
         seeds_i,
         pred_i,
         window_size=(820, 820),
+        show_scipy_voronoi=True,
+        show_core_curves=True,
     ):
         width, height = int(window_size[0]), int(window_size[1])
         uv = cache_i["uv_dense"].detach().cpu().numpy().astype(np.float64)
         faces = cache_i["faces_ijk"].detach().cpu().numpy().astype(np.int64)
         seeds = seeds_i.detach().cpu().numpy().astype(np.float64)
+        topology_seeds_t = out_i.get("topology_seeds_uv", None)
+        topology_seeds = None
+        if isinstance(topology_seeds_t, torch.Tensor):
+            topology_seeds = topology_seeds_t.detach().cpu().numpy().astype(np.float64)
+        elif topology_seeds_t is not None:
+            topology_seeds = np.asarray(topology_seeds_t, dtype=np.float64)
         curves_uv_t = out_i.get("edge_curves_uv", None)
         curves_uv = None
         if isinstance(curves_uv_t, torch.Tensor):
@@ -3260,6 +3886,50 @@ class NN_Trainer:
                 alpha=0.45,
                 linewidths=0,
             )
+
+        def plot_clipped_segment(p0, p1, color, linewidth, alpha, zorder):
+            clipped = self._clip_segment_to_uv_box_np(p0, p1)
+            if clipped is None:
+                return
+            q0, q1 = clipped
+            ax.plot(
+                [q0[0], q1[0]],
+                [q0[1], q1[1]],
+                color=color,
+                linewidth=linewidth,
+                alpha=alpha,
+                zorder=zorder,
+            )
+
+        if show_scipy_voronoi and topology_seeds is not None and topology_seeds.ndim == 2 and topology_seeds.shape[0] >= 3:
+            finite_topology_seeds = topology_seeds[np.isfinite(topology_seeds).all(axis=1)]
+            if finite_topology_seeds.shape[0] >= 3:
+                try:
+                    from scipy.spatial import Voronoi, voronoi_plot_2d
+                    raw_voronoi = Voronoi(finite_topology_seeds)
+                    voronoi_plot_2d(
+                        raw_voronoi,
+                        ax=ax,
+                        show_vertices=False,
+                        show_points=False,
+                        line_colors="#2563eb",
+                        line_width=1.05,
+                        line_alpha=0.58,
+                        point_size=0,
+                    )
+                    if raw_voronoi.vertices.size > 0:
+                        ax.scatter(
+                            raw_voronoi.vertices[:, 0],
+                            raw_voronoi.vertices[:, 1],
+                            marker="x",
+                            c="#374151",
+                            s=38,
+                            linewidths=1.0,
+                            alpha=0.82,
+                            zorder=4,
+                        )
+                except Exception:
+                    pass
 
         active_values = pred_i.get("seed_active_mask", None)
         if active_values is not None:
@@ -3294,7 +3964,7 @@ class NN_Trainer:
                     zorder=6,
                 )
 
-        if curves_uv is not None and curves_uv.ndim == 3:
+        if show_core_curves and curves_uv is not None and curves_uv.ndim == 3:
             for curve in curves_uv:
                 if curve.shape[0] >= 2:
                     ax.plot(
@@ -3316,6 +3986,62 @@ class NN_Trainer:
         for spine in ax.spines.values():
             spine.set_color("#9ca3af")
 
+        fig.canvas.draw()
+        img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        img = img[..., :3].copy()
+        plt.close(fig)
+        return img
+
+    def _render_first_face_generated_graph_2d(
+        self,
+        decoder,
+        out_i,
+        seeds_i,
+        window_size=(820, 820),
+        show_node_ids=False,
+        show_edge_ids=False,
+    ):
+        width, height = int(window_size[0]), int(window_size[1])
+        fig = plt.figure(figsize=(width / 100.0, height / 100.0), dpi=100, facecolor="white")
+        ax = fig.add_axes([0.08, 0.08, 0.88, 0.84])
+        topology_seeds = out_i.get("topology_seeds_uv", seeds_i)
+        try:
+            decoder._draw_generated_graph(
+                ax,
+                topology_seeds,
+                out_i,
+                show_node_ids=show_node_ids,
+                show_edge_ids=show_edge_ids,
+                node_id_fontsize=7,
+                show_pruned_nodes=False,
+                color_by_edge_type=True,
+            )
+            ax.set_title("Generated Connectivity Graph", fontsize=12)
+        except Exception as error:
+            ax.text(
+                0.5,
+                0.5,
+                f"Generated graph unavailable\n{error}",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color="#111827",
+                transform=ax.transAxes,
+            )
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_aspect("equal", adjustable="box")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            by_label = dict(zip(labels, handles))
+            ax.legend(
+                by_label.values(),
+                by_label.keys(),
+                fontsize=6,
+                loc="upper right",
+                framealpha=0.78,
+            )
         fig.canvas.draw()
         img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
         img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
@@ -3667,29 +4393,18 @@ class NN_Trainer:
         # ------------------------------------------------------------
         # 6) Evaluate decoder on CAD-native dense query points
         # ------------------------------------------------------------
-        tau = self._fallback_tau_value() if pred.get("tau") is None else pred["tau"]
-        decoder_out = decoder.evaluate_at_uv(
+        decoder_out = decoder.build_swept_tube_fields(
             points_uv=uv_dense,
+            points_3d=xyz_dense,
+            seeds_uv=seeds_raw,
+            w_raw=w_raw,
             Xu=Xu_dense,
             Xv=Xv_dense,
-            points_3d=xyz_dense,
-            tau=tau,
-            seeds_raw=seeds_raw,
-            w_raw=w_raw,
-            h_raw=h_raw,
-            theta=theta,
-            a_raw=a_raw,
-            points_face_id=local_face_id,
-            boundary_uv=boundary_uv_i,
-            boundary_face_id=boundary_face_id_i,
-            boundary_width_raw=boundary_width_raw,
-            boundary_alpha_raw=None,
-            boundary_beta_raw=None,
-            centerline_radius_raw=_centerline_radius_raw_from_w(self.cfg, w_raw),
-            hard_seed_mask=True,
-            seed_domain_mask=self._seed_domain_mask_for_face(ft),
-            seed_domain_mask_threshold=self.cfg.seed_domain_mask_threshold,
-            seed_domain_temp=self.cfg.seed_domain_temp,
+            cad_domain=self.Cad_domain,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+            return_xyz=True,
+            generate_density_fiber=getattr(self.cfg, "generate_decoder_density_fiber", True),
         )
 
         self._require_decoder_keys(
@@ -4620,6 +5335,8 @@ class NN_Trainer:
         norm_rep = RunningNorm()
         norm_bnd = RunningNorm()
         norm_fem = RunningNorm()
+        norm_curve_length = RunningNorm()
+        norm_cell_edge_uniform = RunningNorm()
 
         # ------------------------------------------------------------
         # Best-state tracking
@@ -4721,6 +5438,9 @@ class NN_Trainer:
 
                 rep_terms = []
                 bnd_terms = []
+                curve_length_terms = []
+                curve_length_values = []
+                cell_edge_uniform_terms = []
                 w_geo_terms = []
                 h_terms = []
                 centerline_radius_terms = []
@@ -4733,6 +5453,10 @@ class NN_Trainer:
                 compute_rep_loss = cfg.lam_rep != 0.0
                 compute_bnd_loss = cfg.lam_bnd != 0.0
                 compute_vol_loss = cfg.lam_vol != 0.0
+                compute_curve_length_loss = getattr(cfg, "lam_curve_length", 0.0) != 0.0
+                compute_cell_edge_uniform_loss = (
+                    getattr(cfg, "lam_cell_edge_uniform", 0.0) != 0.0
+                )
 
                 # Determine whether to update seed anchors based on the configuration and current step, seed anchors are reference points used in the training process.
                 # if it is on, it will update the seed anchors after a certain warmup period, and the update is allowed based on the configuration settings.
@@ -4784,47 +5508,48 @@ class NN_Trainer:
 
 
                     decoder_out = decoder(
-                        points_uv=ft["uv"],
-                        Xu=ft["Xu"],
-                        Xv=ft["Xv"],
-                        tau=tau_step,
-                        seeds_raw=seeds_raw_i,
+                        seeds_uv=seeds_raw_i,
                         w_raw=w_raw_i,
-                        h_raw=None,
-                        theta=None,
-                        a_raw=None,
-                        points_3d=ft["points_xyz"],
-                        points_face_id=local_face_id,
-                        boundary_uv=boundary_uv_i,
-                        boundary_face_id=boundary_face_id_i,
-                        boundary_width_raw=None,
-                        boundary_alpha_raw=None,
-                        boundary_beta_raw=None,
-                        centerline_radius_raw=_centerline_radius_raw_from_w(cfg, w_raw_i),
-                        seed_domain_mask=seed_domain_mask_i,
-                        seed_domain_mask_threshold=cfg.seed_domain_mask_threshold,
-                        seed_domain_temp=cfg.seed_domain_temp,
-                    )
-
-                    decoder_out, density_post_stats_i = apply_density_postprocess_to_output(
-                        decoder_out,
-                        ft,
-                        cfg,
-                        return_debug=True,
+                        generate_density_fiber=getattr(cfg, "generate_decoder_density_fiber", True),
                     )
 
                     self._require_decoder_keys(
                         decoder_out,
                         [
                             "seeds",
-                            "rho",
-                            "fiber3d",
                         ],
                     )
 
+                    if compute_curve_length_loss:
+                        curve_length_values.append(self.curve_3d_edge_lengths(decoder_out).detach())
+                        curve_length_terms.append(self.curve_length_similarity_loss(decoder_out))
+                    if compute_cell_edge_uniform_loss:
+                        cell_edge_uniform_terms.append(
+                            self.cell_edge_uniformity_loss(decoder_out)
+                        )
+
                     seeds_i = decoder_out["seeds"]
-                    rho_i = decoder_out["rho"]
-                    fiber3d_i = decoder_out["fiber3d"]
+                    if getattr(cfg, "generate_decoder_density_fiber", True):
+                        decoder_out, density_post_stats_i = apply_density_postprocess_to_output(
+                            decoder_out,
+                            ft,
+                            cfg,
+                            return_debug=True,
+                        )
+                        self._require_decoder_keys(
+                            decoder_out,
+                            [
+                                "rho",
+                                "fiber3d",
+                            ],
+                        )
+                        rho_i = decoder_out["rho"]
+                        fiber3d_i = decoder_out["fiber3d"]
+                    else:
+                        rho_i, fiber3d_i, density_post_stats_i = self.neutral_density_fiber_fields(
+                            ft["uv"],
+                            ft.get("Xu", None),
+                        )
                     if "w_geo" in decoder_out:
                         w_geo_i = decoder_out["w_geo"]
                     elif hasattr(decoder, "width"):
@@ -4954,10 +5679,20 @@ class NN_Trainer:
                 fiber_norm = fiber_surface.norm(dim=1, keepdim=True).clamp_min(cfg.eps)
                 fiber_surface = fiber_surface / fiber_norm
 
-                zero = torch.zeros((), dtype=dtype, device=device)
+                zero = self._trainable_zero(ppnets, dtype=dtype, device=device)
 
                 loss_rep = rep_terms[0] if compute_rep_loss and rep_terms else zero
                 loss_bnd = bnd_terms[0] if compute_bnd_loss and bnd_terms else zero
+                loss_curve_length = (
+                    curve_length_terms[0]
+                    if compute_curve_length_loss and curve_length_terms
+                    else zero
+                )
+                loss_cell_edge_uniform = (
+                    cell_edge_uniform_terms[0]
+                    if compute_cell_edge_uniform_loss and cell_edge_uniform_terms
+                    else zero
+                )
 
                 w_geo_mean = w_geo_terms[0] if w_geo_terms else zero
                 h_mean = h_terms[0] if h_terms else zero
@@ -5029,9 +5764,13 @@ class NN_Trainer:
                     n_vol = norm_vol.update(loss_vol.detach().item())
                     n_rep = norm_rep.update(loss_rep.detach().item())
                     n_bnd = norm_bnd.update(loss_bnd.detach().item())
+                    n_curve_length = norm_curve_length.update(loss_curve_length.detach().item())
+                    n_cell_edge_uniform = norm_cell_edge_uniform.update(
+                        loss_cell_edge_uniform.detach().item()
+                    )
                     n_fem = norm_fem.update(loss_fem.detach().item()) if (cfg.lam_fem != 0.0 and fem_is_valid) else 1.0
                 else:
-                    n_vol = n_rep = n_bnd = n_fem = 1.0
+                    n_vol = n_rep = n_bnd = n_fem = n_curve_length = n_cell_edge_uniform = 1.0
 
                 # ----------------------------------------------------
                 # Total loss
@@ -5039,9 +5778,13 @@ class NN_Trainer:
                 lam_width_active_eff = 0.0
 
                 L_total = (
-                    cfg.lam_vol * (loss_vol / n_vol)
+                    zero
+                    + cfg.lam_vol * (loss_vol / n_vol)
                     + cfg.lam_rep * (loss_rep / n_rep)
                     + cfg.lam_bnd * (loss_bnd / n_bnd)
+                    + cfg.lam_curve_length * (loss_curve_length / n_curve_length)
+                    + cfg.lam_cell_edge_uniform
+                    * (loss_cell_edge_uniform / n_cell_edge_uniform)
                 )
 
                 if cfg.lam_fem != 0.0:
@@ -5056,6 +5799,8 @@ class NN_Trainer:
                     ("loss_vol", loss_vol),
                     ("loss_rep", loss_rep),
                     ("loss_bnd", loss_bnd),
+                    ("loss_curve_length", loss_curve_length),
+                    ("loss_cell_edge_uniform", loss_cell_edge_uniform),
                     ("loss_fem", loss_fem),
                     ("loss_comp", loss_comp),
                 ]
@@ -5222,6 +5967,21 @@ class NN_Trainer:
                     rho_min = float(rho.min().item())
                     rho_mean = float(rho.mean().item())
                     rho_max = float(rho.max().item())
+                    nonempty_curve_lengths = [
+                        v.reshape(-1) for v in curve_length_values if v.numel() > 0
+                    ]
+                    if nonempty_curve_lengths:
+                        curve_lengths = torch.cat(nonempty_curve_lengths, dim=0)
+                    else:
+                        curve_lengths = zero.new_empty((0,))
+                    if curve_lengths.numel() > 0:
+                        curve_length_min = float(curve_lengths.min().item())
+                        curve_length_max = float(curve_lengths.max().item())
+                        curve_length_mean = float(curve_lengths.mean().item())
+                    else:
+                        curve_length_min = float("nan")
+                        curve_length_max = float("nan")
+                        curve_length_mean = float("nan")
 
                     g_mean = 0.0
                     g_count = 0
@@ -5237,6 +5997,11 @@ class NN_Trainer:
                         "loss_vol": self._finite_or_default(loss_vol),
                         "loss_rep": self._finite_or_default(loss_rep),
                         "loss_bnd": self._finite_or_default(loss_bnd),
+                        "loss_curve_length": self._finite_or_default(loss_curve_length),
+                        "curve_length_min": curve_length_min,
+                        "curve_length_max": curve_length_max,
+                        "curve_length_mean": curve_length_mean,
+                        "loss_cell_edge_uniform": self._finite_or_default(loss_cell_edge_uniform),
                         "loss_fem": self._finite_or_default(loss_fem),
                         "loss_comp": self._finite_or_default(loss_comp),
                         "comp": self._finite_or_default(comp_val),
@@ -5300,6 +6065,8 @@ class NN_Trainer:
                         tau=f"{row['tau']:.2e}",
                         w=f"{row['w_geo_mean']:.3e}",
                         clr=f"{row['centerline_radius_mean']:.3e}",
+                        lcurve=f"{row['loss_curve_length']:.2e}",
+                        lcell=f"{row['loss_cell_edge_uniform']:.2e}",
                         dmin=f"{row['min_seed_dist']:.3e}",
                         active=f"{participating_count_mean:.1f}",
                         fem="OK" if fem_is_valid else "BAD",
@@ -5307,14 +6074,23 @@ class NN_Trainer:
                     )
 
                     if cfg.MakeTimelaps and step % cfg.timelapse_frame_step == 0:
-                        cad_img = self._render_current_cad_frame_cached(
-                            seeds_list=seeds_list,
-                            decoders=decoders,
-                            pred_list=pred_list,
-                            render_cache=render_cache,
-                            thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
-                            loading_img=self.timelapse_loading_img,
-                        )
+                        if getattr(cfg, "timelapse_show_3d_tubes", True):
+                            cad_img = self._render_current_3d_tube_frame_cached(
+                                seeds_list=seeds_list,
+                                decoders=decoders,
+                                pred_list=pred_list,
+                                render_cache=render_cache,
+                                loading_img=self.timelapse_loading_img,
+                            )
+                        else:
+                            cad_img = self._render_current_cad_frame_cached(
+                                seeds_list=seeds_list,
+                                decoders=decoders,
+                                pred_list=pred_list,
+                                render_cache=render_cache,
+                                thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                                loading_img=self.timelapse_loading_img,
+                            )
 
                         loss_dict = {
                             "L_Total": row["L_total"],
@@ -5322,6 +6098,8 @@ class NN_Trainer:
                             "L_FEM": row["loss_fem"],
                             "L_Bnd": row["loss_bnd"],
                             "L_Rep": row["loss_rep"],
+                            "L_CurveLen": row["loss_curve_length"],
+                            "L_CellEdge": row["loss_cell_edge_uniform"],
                         }
 
                         recorder.add_frame(
@@ -5364,7 +6142,10 @@ class NN_Trainer:
                             f"L_vol={row['loss_vol']:.3e} "
                             f"L_fem={row['loss_fem']:.3e} "
                             f"L_rep={row['loss_rep']:.3e} "
-                            f"L_bnd={row['loss_bnd']:.3e} |"
+                            f"L_bnd={row['loss_bnd']:.3e} "
+                            f"L_curve={row['loss_curve_length']:.3e} "
+                            f"L(min/max/mean)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e} "
+                            f"L_cell_edge={row['loss_cell_edge_uniform']:.3e} |"
                             f"VF_total={row['VF_total']:.3f} "
                             f"VF_eff_total={row['VF_eff_total']:.3f} "
                             f"VF_int={row['VF_int']:.3f} "
@@ -5562,47 +6343,34 @@ class NN_Trainer:
                         dtype=torch.long,
                         device=device,
                     )
-                seed_domain_mask_i = self._seed_domain_mask_for_face(face_tensor)
-
-                tau_i = self._fallback_tau_value() if pred_i.get("tau") is None else pred_i["tau"]
                 try:
-                    hard_out_i = decoder.evaluate_at_uv(
-                        points_uv=face_tensor["uv"],
-                        Xu=face_tensor["Xu"],
-                        Xv=face_tensor["Xv"],
-                        points_3d=face_tensor["points_xyz"],
-                        tau=tau_i,
-                        seeds_raw=pred_i["seeds_raw"],
+                    hard_out_i = decoder(
+                        seeds_uv=pred_i["seeds_raw"],
                         w_raw=pred_i["w_raw"],
-                        h_raw=pred_i.get("h_raw", None),
-                        theta=pred_i.get("theta", None),
-                        a_raw=pred_i.get("a_raw", None),
-                        points_face_id=local_face_id,
-                        boundary_uv=boundary_uv_i,
-                        boundary_face_id=boundary_face_id_i,
-                        boundary_width_raw=pred_i.get("boundary_width_raw", None),
-                        boundary_alpha_raw=pred_i.get("boundary_alpha_raw", None),
-                        boundary_beta_raw=pred_i.get("boundary_beta_raw", None),
-                        centerline_radius_raw=_centerline_radius_raw_from_w(cfg, pred_i["w_raw"]),
-                        hard_seed_mask=True,
-                        seed_domain_mask=seed_domain_mask_i,
-                        seed_domain_mask_threshold=cfg.seed_domain_mask_threshold,
-                        seed_domain_temp=cfg.seed_domain_temp,
+                        generate_density_fiber=getattr(cfg, "generate_decoder_density_fiber", True),
                     )
                 finally:
                     self._restore_decoder_seed_state(decoder, decoder_seed_state)
 
-                hard_out_i = apply_density_postprocess_to_output(
-                    hard_out_i,
-                    face_tensor,
-                    cfg,
-                    return_debug=False,
-                )
+                if getattr(cfg, "generate_decoder_density_fiber", True):
+                    hard_out_i = apply_density_postprocess_to_output(
+                        hard_out_i,
+                        face_tensor,
+                        cfg,
+                        return_debug=False,
+                    )
+                    hard_rho_i = hard_out_i["rho"]
+                    hard_fiber_i = hard_out_i["fiber3d"]
+                else:
+                    hard_rho_i, hard_fiber_i, _ = self.neutral_density_fiber_fields(
+                        face_tensor["uv"],
+                        face_tensor.get("Xu", None),
+                    )
 
                 w_local = A_local.clamp_min(cfg.eps)
-                hard_rho_acc[gidx] += hard_out_i["rho"] * w_local
+                hard_rho_acc[gidx] += hard_rho_i * w_local
                 hard_rho_wgt[gidx] += w_local
-                hard_fiber_acc[gidx] += hard_out_i["fiber3d"] * w_local[:, None]
+                hard_fiber_acc[gidx] += hard_fiber_i * w_local[:, None]
                 hard_fiber_wgt[gidx] += w_local
 
             final_shape_density = hard_rho_acc / hard_rho_wgt.clamp_min(cfg.eps)
@@ -5736,6 +6504,8 @@ class NN_Trainer:
                     "L_FEM": float(best_row["loss_fem"]) if best_row is not None else float("nan"),
                     "L_Bnd": float(best_row["loss_bnd"]) if best_row is not None else float("nan"),
                     "L_Rep": float(best_row["loss_rep"]) if best_row is not None else float("nan"),
+                    "L_CurveLen": float(best_row["loss_curve_length"]) if best_row is not None else float("nan"),
+                    "L_CellEdge": float(best_row["loss_cell_edge_uniform"]) if best_row is not None else float("nan"),
                 }
                 results_text = (
                     f"VF_total={best_vol_total:.6g} | "
@@ -5751,14 +6521,23 @@ class NN_Trainer:
                 if best_pred:
                     decoder_seed_state = self._decoder_seed_state_for_pred(decoder, best_pred[0], device)
                 try:
-                    best_cad_img = self._render_current_cad_frame_cached(
-                        seeds_list=best_seeds,
-                        decoders=decoders,
-                        pred_list=best_pred,
-                        render_cache=render_cache,
-                        thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
-                        loading_img=self.timelapse_loading_img,
-                    )
+                    if getattr(cfg, "timelapse_show_3d_tubes", True):
+                        best_cad_img = self._render_current_3d_tube_frame_cached(
+                            seeds_list=best_seeds,
+                            decoders=decoders,
+                            pred_list=best_pred,
+                            render_cache=render_cache,
+                            loading_img=self.timelapse_loading_img,
+                        )
+                    else:
+                        best_cad_img = self._render_current_cad_frame_cached(
+                            seeds_list=best_seeds,
+                            decoders=decoders,
+                            pred_list=best_pred,
+                            render_cache=render_cache,
+                            thr=getattr(cfg, "vis_thr", cfg.TM_laps_Thr),
+                            loading_img=self.timelapse_loading_img,
+                        )
                 finally:
                     if decoder_seed_state is not None:
                         self._restore_decoder_seed_state(decoder, decoder_seed_state)

@@ -8,10 +8,10 @@ from OCC.Core.STEPControl import STEPControl_Reader
 from OCC.Core.IGESControl import IGESControl_Reader
 from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_ON
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_ON, TopAbs_REVERSED, TopAbs_WIRE
 from OCC.Core.TopoDS import topods
-from OCC.Core.BRepAdaptor import BRepAdaptor_Surface
-from OCC.Core.BRepTools import breptools
+from OCC.Core.BRepAdaptor import BRepAdaptor_Curve2d, BRepAdaptor_Surface
+from OCC.Core.BRepTools import BRepTools_WireExplorer, breptools
 from OCC.Core.BRep import BRep_Tool
 from OCC.Core.gp import gp_Pnt2d
 from OCC.Core.GeomLProp import GeomLProp_SLProps
@@ -120,6 +120,9 @@ class CADTensorGenerator:
         mesh_n_v: int = 40,
         mesh_size_scale: float = 1.0,
         mesh_algorithm: int = 6,
+        boundary_c1_angle_tol_degrees: float = 45.0,
+        boundary_min_piece_points: int = 2,
+        boundary_edge_samples: int = 33,
     ):
         self.shape_path = None if shape_path is None else os.fspath(shape_path)
         self.metric_tol = float(metric_tol)
@@ -130,6 +133,9 @@ class CADTensorGenerator:
         self.mesh_n_v = int(mesh_n_v)
         self.mesh_size_scale = float(mesh_size_scale)
         self.mesh_algorithm = int(mesh_algorithm)
+        self.boundary_c1_angle_tol_degrees = float(boundary_c1_angle_tol_degrees)
+        self.boundary_min_piece_points = max(2, int(boundary_min_piece_points))
+        self.boundary_edge_samples = max(2, int(boundary_edge_samples))
 
         self._active_shape = None
         self._active_face = None
@@ -139,6 +145,8 @@ class CADTensorGenerator:
         self._seed_domain_mask_grid = None
         self._seed_domain_sdf_grid = None
         self._boundary_parameter_loops = None
+        self._boundary_curve_pieces = None
+        self._boundary_curve_tensors_cache = None
         self._u_periodic = False
         self._v_periodic = False
         self._u_period = None
@@ -428,6 +436,275 @@ class CADTensorGenerator:
             )
         self._boundary_parameter_loops = loops
         return loops
+
+    @staticmethod
+    def _signed_loop_area_uv(loop: np.ndarray) -> float:
+        """Signed polygon area in normalized UV."""
+        loop = np.asarray(loop, dtype=np.float64)
+        if loop.shape[0] < 3:
+            return 0.0
+        if np.linalg.norm(loop[0] - loop[-1]) > 1e-12:
+            loop = np.concatenate((loop, loop[:1]), axis=0)
+        x = loop[:, 0]
+        y = loop[:, 1]
+        return float(0.5 * np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]))
+
+    @staticmethod
+    def _polyline_arclength(points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float64)
+        if points.shape[0] == 0:
+            return np.zeros((0,), dtype=np.float64)
+        if points.shape[0] == 1:
+            return np.zeros((1,), dtype=np.float64)
+        lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        return np.concatenate(([0.0], np.cumsum(lengths)))
+
+    def _split_loop_at_c1_breaks(self, loop: np.ndarray) -> list[np.ndarray]:
+        """Split a closed trim loop into approximately C1-continuous polyline pieces."""
+        loop = np.asarray(loop, dtype=np.float64)
+        if loop.ndim != 2 or loop.shape[1] != 2 or loop.shape[0] < 2:
+            return []
+        is_closed = bool(np.linalg.norm(loop[0] - loop[-1]) <= 1e-12)
+        if is_closed:
+            loop_open = loop[:-1]
+        else:
+            loop_open = loop
+        n = int(loop_open.shape[0])
+        if n < self.boundary_min_piece_points:
+            return []
+
+        if not is_closed and n <= 2:
+            return [loop_open]
+
+        prev_vec = loop_open - np.roll(loop_open, 1, axis=0)
+        next_vec = np.roll(loop_open, -1, axis=0) - loop_open
+        prev_len = np.linalg.norm(prev_vec, axis=1)
+        next_len = np.linalg.norm(next_vec, axis=1)
+        valid = (prev_len > 1e-12) & (next_len > 1e-12)
+        if not is_closed:
+            valid[0] = False
+            valid[-1] = False
+        cos_angle = np.ones((n,), dtype=np.float64)
+        cos_angle[valid] = np.sum(prev_vec[valid] * next_vec[valid], axis=1) / (
+            prev_len[valid] * next_len[valid]
+        )
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        turn_angle = np.arccos(cos_angle)
+        angle_tol = np.deg2rad(max(float(self.boundary_c1_angle_tol_degrees), 0.0))
+        break_ids = np.nonzero(valid & (turn_angle > angle_tol))[0].tolist()
+
+        if not break_ids:
+            return [np.concatenate((loop_open, loop_open[:1]), axis=0)] if is_closed else [loop_open]
+
+        break_ids = sorted(set(int(i) for i in break_ids))
+        pieces: list[np.ndarray] = []
+        if is_closed:
+            for local_id, start in enumerate(break_ids):
+                end = break_ids[(local_id + 1) % len(break_ids)]
+                if end <= start:
+                    ids = list(range(start, n)) + list(range(0, end + 1))
+                else:
+                    ids = list(range(start, end + 1))
+                piece = loop_open[np.asarray(ids, dtype=np.int64)]
+                if piece.shape[0] >= self.boundary_min_piece_points:
+                    pieces.append(piece)
+        else:
+            cut_ids = [0] + break_ids + [n - 1]
+            for start, end in zip(cut_ids[:-1], cut_ids[1:]):
+                piece = loop_open[start : end + 1]
+                if piece.shape[0] >= self.boundary_min_piece_points:
+                    pieces.append(piece)
+        if not pieces:
+            return [np.concatenate((loop_open, loop_open[:1]), axis=0)] if is_closed else [loop_open]
+        return pieces
+
+    def _sample_edge_uv_norm(self, edge, face) -> np.ndarray:
+        curve = BRepAdaptor_Curve2d(edge, face)
+        t0 = float(curve.FirstParameter())
+        t1 = float(curve.LastParameter())
+        if edge.Orientation() == TopAbs_REVERSED:
+            t = np.linspace(t1, t0, self.boundary_edge_samples)
+        else:
+            t = np.linspace(t0, t1, self.boundary_edge_samples)
+        raw = np.empty((t.shape[0], 2), dtype=np.float64)
+        for index, value in enumerate(t):
+            point = curve.Value(float(value))
+            raw[index] = (point.X(), point.Y())
+        uv = self.uv_raw_to_norm_from_bounds(
+            raw,
+            u_raw_bounds=self._active_u_raw_bounds,
+            v_raw_bounds=self._active_v_raw_bounds,
+        )
+        uv = np.clip(np.asarray(uv, dtype=np.float64), 0.0, 1.0)
+        keep = np.ones((uv.shape[0],), dtype=bool)
+        if uv.shape[0] > 1:
+            keep[1:] = np.linalg.norm(np.diff(uv, axis=0), axis=1) > 1e-12
+        return uv[keep]
+
+    def _build_cad_boundary_curve_pieces(self) -> list[dict]:
+        """Extract topological trim edges from OpenCascade as UV curve pieces."""
+        self._require_active_face()
+        pieces: list[dict] = []
+        wire_exp = TopExp_Explorer(self._active_face, TopAbs_WIRE)
+        loop_id = 0
+        while wire_exp.More():
+            wire = topods.Wire(wire_exp.Current())
+            wire_explorer = BRepTools_WireExplorer(wire, self._active_face)
+            edge_samples: list[np.ndarray] = []
+            while wire_explorer.More():
+                edge = topods.Edge(wire_explorer.Current())
+                uv = self._sample_edge_uv_norm(edge, self._active_face)
+                if uv.shape[0] >= self.boundary_min_piece_points:
+                    if edge_samples:
+                        prev_end = edge_samples[-1][-1]
+                        forward_gap = np.linalg.norm(uv[0] - prev_end)
+                        reverse_gap = np.linalg.norm(uv[-1] - prev_end)
+                        if reverse_gap < forward_gap:
+                            uv = uv[::-1].copy()
+                    edge_samples.append(uv)
+                wire_explorer.Next()
+
+            if not edge_samples:
+                wire_exp.Next()
+                loop_id += 1
+                continue
+
+            loop_points = []
+            for edge_id, uv in enumerate(edge_samples):
+                loop_points.append(uv if edge_id == 0 else uv[1:])
+            loop = np.concatenate(loop_points, axis=0)
+            area = self._signed_loop_area_uv(loop)
+            loop_kind = "outer" if area >= 0.0 else "hole"
+
+            for piece_id, points in enumerate(self._split_loop_at_c1_breaks(loop)):
+                arclength = self._polyline_arclength(points)
+                pieces.append(
+                    {
+                        "uv": points,
+                        "loop_id": int(loop_id),
+                        "piece_id_in_loop": int(piece_id),
+                        "loop_kind": loop_kind,
+                        "loop_area": float(area),
+                        "arclength": arclength,
+                        "length": float(arclength[-1]) if arclength.size else 0.0,
+                        "is_closed_loop_piece": bool(
+                            points.shape[0] > 2 and np.linalg.norm(points[0] - points[-1]) <= 1e-12
+                        ),
+                    }
+                )
+
+            wire_exp.Next()
+            loop_id += 1
+
+        if not pieces:
+            raise RuntimeError("No OpenCascade trim-edge UV curves could be extracted.")
+        return pieces
+
+    def build_boundary_curve_pieces(self) -> list[dict]:
+        """Return C1-split trim-boundary curve pieces in normalized UV."""
+        if self._boundary_curve_pieces is not None:
+            return self._boundary_curve_pieces
+        if self._active_face is not None:
+            try:
+                self._boundary_curve_pieces = self._build_cad_boundary_curve_pieces()
+                return self._boundary_curve_pieces
+            except Exception:
+                pass
+        loops = self._boundary_parameter_loops
+        if loops is None:
+            loops = self._build_boundary_parameter_loops()
+
+        pieces: list[dict] = []
+        for loop_id, loop in enumerate(loops):
+            loop = np.asarray(loop, dtype=np.float64)
+            area = self._signed_loop_area_uv(loop)
+            loop_kind = "outer" if area >= 0.0 else "hole"
+            split = self._split_loop_at_c1_breaks(loop)
+            for piece_id, points in enumerate(split):
+                arclength = self._polyline_arclength(points)
+                pieces.append(
+                    {
+                        "uv": points,
+                        "loop_id": int(loop_id),
+                        "piece_id_in_loop": int(piece_id),
+                        "loop_kind": loop_kind,
+                        "loop_area": float(area),
+                        "arclength": arclength,
+                        "length": float(arclength[-1]) if arclength.size else 0.0,
+                        "is_closed_loop_piece": bool(
+                            points.shape[0] > 2 and np.linalg.norm(points[0] - points[-1]) <= 1e-12
+                        ),
+                    }
+                )
+
+        self._boundary_curve_pieces = pieces
+        return pieces
+
+    def boundary_curve_tensors(self, as_torch: bool = True) -> dict:
+        """Packed C1-split trim curves for topology clipping and visualization."""
+        if as_torch and self._boundary_curve_tensors_cache is not None:
+            return self._boundary_curve_tensors_cache
+
+        pieces = self.build_boundary_curve_pieces()
+        offsets = [0]
+        uv_parts = []
+        arclength_parts = []
+        loop_ids = []
+        piece_ids = []
+        loop_kind_ids = []
+        loop_areas = []
+        lengths = []
+        closed_flags = []
+
+        for piece in pieces:
+            uv = np.asarray(piece["uv"], dtype=np.float64)
+            arclength = np.asarray(piece["arclength"], dtype=np.float64)
+            uv_parts.append(uv)
+            arclength_parts.append(arclength)
+            offsets.append(offsets[-1] + int(uv.shape[0]))
+            loop_ids.append(int(piece["loop_id"]))
+            piece_ids.append(int(piece["piece_id_in_loop"]))
+            loop_kind_ids.append(0 if piece["loop_kind"] == "outer" else 1)
+            loop_areas.append(float(piece["loop_area"]))
+            lengths.append(float(piece["length"]))
+            closed_flags.append(bool(piece["is_closed_loop_piece"]))
+
+        if uv_parts:
+            uv_np = np.concatenate(uv_parts, axis=0)
+            arclength_np = np.concatenate(arclength_parts, axis=0)
+        else:
+            uv_np = np.empty((0, 2), dtype=np.float64)
+            arclength_np = np.empty((0,), dtype=np.float64)
+
+        data_np = {
+            "boundary_curve_uv": uv_np,
+            "boundary_curve_arclength": arclength_np,
+            "boundary_curve_offsets": np.asarray(offsets, dtype=np.int64),
+            "boundary_curve_loop_id": np.asarray(loop_ids, dtype=np.int64),
+            "boundary_curve_piece_id": np.asarray(piece_ids, dtype=np.int64),
+            "boundary_curve_loop_kind": np.asarray(loop_kind_ids, dtype=np.int64),
+            "boundary_curve_loop_area": np.asarray(loop_areas, dtype=np.float64),
+            "boundary_curve_length": np.asarray(lengths, dtype=np.float64),
+            "boundary_curve_is_closed": np.asarray(closed_flags, dtype=bool),
+            "boundary_curve_num_pieces": np.asarray(len(pieces), dtype=np.int64),
+        }
+        if not as_torch:
+            return data_np
+
+        data_t = {
+            "boundary_curve_uv": torch.as_tensor(data_np["boundary_curve_uv"], dtype=torch.float32, device=self.device),
+            "boundary_curve_arclength": torch.as_tensor(data_np["boundary_curve_arclength"], dtype=torch.float32, device=self.device),
+            "boundary_curve_offsets": torch.as_tensor(data_np["boundary_curve_offsets"], dtype=torch.long, device=self.device),
+            "boundary_curve_loop_id": torch.as_tensor(data_np["boundary_curve_loop_id"], dtype=torch.long, device=self.device),
+            "boundary_curve_piece_id": torch.as_tensor(data_np["boundary_curve_piece_id"], dtype=torch.long, device=self.device),
+            "boundary_curve_loop_kind": torch.as_tensor(data_np["boundary_curve_loop_kind"], dtype=torch.long, device=self.device),
+            "boundary_curve_loop_area": torch.as_tensor(data_np["boundary_curve_loop_area"], dtype=torch.float32, device=self.device),
+            "boundary_curve_length": torch.as_tensor(data_np["boundary_curve_length"], dtype=torch.float32, device=self.device),
+            "boundary_curve_is_closed": torch.as_tensor(data_np["boundary_curve_is_closed"], dtype=torch.bool, device=self.device),
+            "boundary_curve_num_pieces": torch.as_tensor(data_np["boundary_curve_num_pieces"], dtype=torch.long, device=self.device),
+        }
+        self._boundary_curve_tensors_cache = data_t
+        return data_t
 
     def boundary_parameter(self, uv_norm):
         """Return nearest trim-loop id and cyclic arclength for UV boundary points.
@@ -893,6 +1170,7 @@ class CADTensorGenerator:
             "min_vol_frac": torch.tensor(0.0, dtype=points.dtype, device=self.device),
             "BBX": bbox,
         }
+        shell_tensors.update(self.boundary_curve_tensors(as_torch=True))
         self._shell_tensors_cache = shell_tensors
         self._shell_mesh_cache_key = cache_key
         return shell_tensors
@@ -1081,8 +1359,11 @@ class CADTensorGenerator:
             device=self.device,
         )
         self._boundary_parameter_loops = None
+        self._boundary_curve_pieces = None
+        self._boundary_curve_tensors_cache = None
         self._shell_tensors_cache = None
         self._shell_mesh_cache_key = None
+        boundary_tensors = self.boundary_curve_tensors(as_torch=True)
 
         domain = {
             "u_raw_bounds": self._active_u_raw_bounds,
@@ -1096,6 +1377,7 @@ class CADTensorGenerator:
             "u_period": self._u_period,
             "v_period": self._v_period,
         }
+        domain.update(boundary_tensors)
         tensors = self.build_face_mesh_tensors()
         return domain, tensors
 

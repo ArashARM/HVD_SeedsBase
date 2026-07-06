@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from Decoder_CLasses.ContinuousVoronoiDecoder import ContinuousVoronoiDecoder
+from Training.MainTrain import NN_Trainer, TrainingConfig
 
 
 class DummyVoronoiSeedTrainer(nn.Module):
@@ -649,6 +650,189 @@ def test_soft_tube_fem_fields_stream_cdist_chunks() -> None:
     assert torch.allclose(fields["distance"], expected_distance)
     assert torch.isfinite(fields["density"]).all()
     assert torch.isfinite(fields["fiber"]).all()
+
+
+def test_soft_lift_uv_to_xyz_streams_query_chunks() -> None:
+    query_uv = torch.tensor(
+        [
+            [[0.05, 0.10], [0.95, 0.10], [0.25, 0.85]],
+            [[0.75, 0.90], [0.50, 0.50], [0.10, 0.95]],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    support_uv = torch.tensor(
+        [[0.00, 0.00], [0.25, 0.50], [0.75, 0.50], [1.00, 1.00]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    support_xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.2, 0.4, 0.1], [0.8, 0.3, 0.2], [1.0, 1.0, 0.0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    chunked = ContinuousVoronoiDecoder(
+        return_xyz=False,
+        tube_lift_tau=0.2,
+        tube_lift_max_values=5,
+    )
+    full = ContinuousVoronoiDecoder(
+        return_xyz=False,
+        tube_lift_tau=0.2,
+        tube_lift_max_values=1_000_000,
+    )
+
+    actual = chunked.soft_lift_uv_to_xyz(
+        query_uv,
+        support_uv,
+        support_xyz,
+        u_periodic=True,
+        v_periodic=True,
+    )
+    expected = full.soft_lift_uv_to_xyz(
+        query_uv,
+        support_uv,
+        support_xyz,
+        u_periodic=True,
+        v_periodic=True,
+    )
+
+    assert torch.allclose(actual, expected)
+    loss = actual.square().mean()
+    loss.backward()
+    assert query_uv.grad is not None and torch.isfinite(query_uv.grad).all()
+    assert support_uv.grad is not None and torch.isfinite(support_uv.grad).all()
+    assert support_xyz.grad is not None and torch.isfinite(support_xyz.grad).all()
+
+
+def test_cell_edge_uniformity_loss_groups_edges_per_cell() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        lam_cell_angle_uniform=0.0,
+        lam_cell_radial_uniform=0.0,
+    )
+
+    edge_curves_xyz = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    decoder_out = {
+        "edge_curves_xyz": edge_curves_xyz,
+        "graph": {
+            "edge_seed_pair": torch.tensor(
+                [[0, 1], [0, 2], [0, 3], [1, 2]],
+                dtype=torch.long,
+            ),
+            "edge_alpha": torch.ones(4, dtype=torch.float64),
+        },
+    }
+
+    loss = trainer.cell_edge_uniformity_loss(decoder_out)
+
+    assert torch.allclose(loss, edge_curves_xyz.new_tensor(5.0 / 54.0))
+    loss.backward()
+    assert edge_curves_xyz.grad is not None
+    assert torch.isfinite(edge_curves_xyz.grad).all()
+
+
+def test_cell_edge_uniformity_loss_penalizes_per_cell_angles() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        lam_cell_angle_uniform=1.0,
+        lam_cell_radial_uniform=0.0,
+    )
+
+    h = 3.0 ** 0.5 / 2.0
+    edge_curves_xyz = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0], [0.5, h, 0.0]],
+            [[0.5, h, 0.0], [-0.5, h, 0.0]],
+            [[-0.5, h, 0.0], [-1.0, 0.0, 0.0]],
+            [[-1.0, 0.0, 0.0], [-0.5, -h, 0.0]],
+            [[-0.5, -h, 0.0], [0.5, -h, 0.0]],
+            [[0.5, -h, 0.0], [1.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    decoder_out = {
+        "edge_curves_xyz": edge_curves_xyz,
+        "graph": {
+            "edge_seed_pair": torch.tensor(
+                [[0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6]],
+                dtype=torch.long,
+            ),
+            "edge_alpha": torch.ones(6, dtype=torch.float64),
+        },
+    }
+
+    loss = trainer.cell_edge_uniformity_loss(decoder_out)
+
+    assert loss > edge_curves_xyz.new_tensor(0.0)
+    loss.backward()
+    assert edge_curves_xyz.grad is not None
+    assert torch.isfinite(edge_curves_xyz.grad).all()
+
+
+def test_init_face_seed_uses_balanced_fps_by_default() -> None:
+    class DummyGenerator:
+        def __init__(self) -> None:
+            self.called = False
+
+        def fps_3d(self, points_xyz, n_samples, exclude_idx=None, seed=None):
+            self.called = True
+            assert int(n_samples) == 3
+            assert int(seed) == 17
+            assert torch.equal(exclude_idx, torch.tensor([0]))
+            return torch.tensor([1, 3, 4], device=points_xyz.device)
+
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(seed_number=3, seed_init_fps_seed=17)
+    trainer.generator = DummyGenerator()
+    trainer._true_open_boundary_idx = lambda face_tensor: torch.tensor([0])
+
+    face_tensor = {
+        "uv": torch.arange(10, dtype=torch.float32).reshape(5, 2),
+        "points_xyz": torch.arange(15, dtype=torch.float32).reshape(5, 3),
+    }
+
+    seeds = trainer._init_face_seed(face_tensor)
+
+    assert trainer.generator.called
+    assert torch.equal(seeds, face_tensor["uv"][torch.tensor([1, 3, 4])])
+
+
+def test_init_face_seed_can_use_seeded_random_points() -> None:
+    class FpsShouldNotRun:
+        def fps_3d(self, *args, **kwargs):
+            raise AssertionError("fps_3d should not run for random seed init")
+
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        seed_number=3,
+        seed_init_fps_seed=11,
+        use_balanced_seed_init=False,
+    )
+    trainer.generator = FpsShouldNotRun()
+    trainer._true_open_boundary_idx = lambda face_tensor: torch.tensor([0, 4])
+
+    face_tensor = {
+        "uv": torch.arange(10, dtype=torch.float32).reshape(5, 2),
+        "points_xyz": torch.arange(15, dtype=torch.float32).reshape(5, 3),
+    }
+    candidates = torch.tensor([1, 2, 3])
+    expected_order = torch.randperm(candidates.numel(), generator=torch.Generator().manual_seed(11))
+    expected_idx = candidates[expected_order[:3]]
+
+    seeds = trainer._init_face_seed(face_tensor)
+
+    assert torch.equal(seeds, face_tensor["uv"][expected_idx])
 
 
 if __name__ == "__main__":
