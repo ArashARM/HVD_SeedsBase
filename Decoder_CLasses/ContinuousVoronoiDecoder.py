@@ -1,4 +1,5 @@
 from __future__ import annotations
+from time import perf_counter
 from typing import Any, Callable
 import torch
 import torch.nn as nn
@@ -15,8 +16,7 @@ class ContinuousVoronoiDecoder(nn.Module):
     SciPy/Qhull builds discrete topology from real seeds plus fixed guard seeds.
     Guard-related ridges are discarded, and real-real ridges are represented as
     finite segments clipped to the UV box or CAD trim curves. PyTorch then
-    reconstructs those finite clipped segments differentiably. No infinite-ray
-    boundary reconstruction is used.
+    reconstructs those finite clipped segments differentiably.
     """
 
     def __init__(self,Cad_domain: any, face_mesh: torch.Tensor, eps: float=1e-08, solve_reg: float=1e-06, tau_voronoi: float=0.01, tau_box: float=0.01, tau_trim: float=0.01, use_trim_activity: bool=True, return_xyz: bool=True, vertex_boundary_margin: float=0.02, edge_trim_samples: int=32, edge_trim_reduction: str='softmin', edge_trim_reduce_tau: float=0.05, use_edge_trim_gate: bool=True, n_seeds: int | None=None, w_min: float=0.02, w_max_ratio: float=0.5, raw_temp: float=1.0, beta: float=0.02, centerline_softmin_tau: float=0.02, centerline_beta: float | None=None, tube_curve_samples: int=64, tube_lift_tau: float=0.02, tube_lift_max_values: int=4000000, tube_distance_tau: float | None=None, tube_density_tau: float | None=None, tube_fiber_tau: float | None=None, rho_min: float=0.0, face_u_periodic: Any=False, face_v_periodic: Any=False, nearest_segment_k: int=4, use_segment_distance: bool=True, use_spatial_pruning: bool=True, min_tube_spacing: float=1e-3, tube_target_spacing_ratio: float=0.75, use_seed_activation: bool=True, duplicate_merge_sigma: float=1e-4, duplicate_effect_temp_ratio: float=0.25, seed_domain_mask_threshold: float=0.5, min_active_seeds: int=3, **unused_kwargs: Any):
@@ -341,9 +341,6 @@ class ContinuousVoronoiDecoder(nn.Module):
                 Type 4 follows CAD boundary polylines when they are available,
                 otherwise it falls back to the UV-box boundary. Types 0, 1, and
                 3 are differentiable straight Voronoi edge segments.
-
-                Shell edges are retained because CAD/box boundary-loop sampling
-                consumes them directly when building tube centerline curves.
                 """
         nodes_uv = graph['nodes_uv']
         edge_index = graph['edge_index']
@@ -960,6 +957,11 @@ class ContinuousVoronoiDecoder(nn.Module):
         return torch.nan_to_num(edge_gate, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
     @staticmethod
+    def point_inside_box_np(p: np.ndarray, tol: float=1e-09) -> bool:
+        """Hard topology test for the normalized UV box."""
+        return bool(-tol <= float(p[0]) <= 1.0 + tol and -tol <= float(p[1]) <= 1.0 + tol)
+
+    @staticmethod
     def make_box_guard_seeds_np(
         margin: float = 0.25,
         per_side: int = 3,
@@ -1149,7 +1151,6 @@ class ContinuousVoronoiDecoder(nn.Module):
         node_trim_segment_uv_list: list[list[list[float]]] = []
         # boundary_seed_pair is retained as metadata; boundary node positions are reconstructed from finite clipped Voronoi segments.
         boundary_seed_pair_list: list[list[int]] = []
-        # boundary_source_type is used only for shell/CAD bookkeeping.
         boundary_source_type_list: list[int] = []
         node_key_to_id: dict[tuple[int, int], int] = {}
         edges: list[list[int]] = []
@@ -1472,7 +1473,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         compact_type = vertex_type[active_ids]
         return {'nodes_uv': nodes_uv[active_ids], 'vertex_type': compact_type, 'vertex_seed_triples': vertex_seed_triples[active_ids], 'boundary_seed_pair': boundary_seed_pair[active_ids], 'boundary_source_type': boundary_source_type[active_ids], 'edges': compact_edges, 'edge_seed_pairs': edge_seed_pairs, 'edge_type': edge_type, 'alpha': None if alpha is None else alpha[active_ids], 'old_to_new': old_to_new, 'active_vertex_ids': active_ids}
 
-    def differentiable_vertices_from_topology(self, seeds_uv: torch.Tensor, vertex_type: torch.Tensor, vertex_seed_triples: torch.Tensor, u_periodic: bool=False, v_periodic: bool=False, cad_domain: Any | None=None, boundary_source_type: torch.Tensor | None=None, topology_vertices_uv: torch.Tensor | None=None, node_clip_source_vertices: torch.Tensor | None=None, scipy_vertex_aug_seed_triples: torch.Tensor | None=None, guard_seeds_uv: torch.Tensor | None=None, node_trim_segment_uv: torch.Tensor | None=None) -> torch.Tensor:
+    def differentiable_vertices_from_topology(self, seeds_uv: torch.Tensor, vertex_type: torch.Tensor,  boundary_source_type: torch.Tensor | None=None, topology_vertices_uv: torch.Tensor | None=None, node_clip_source_vertices: torch.Tensor | None=None, scipy_vertex_aug_seed_triples: torch.Tensor | None=None, guard_seeds_uv: torch.Tensor | None=None, node_trim_segment_uv: torch.Tensor | None=None) -> torch.Tensor:
         """
         Reconstruct topology nodes differentiably from finite clipped ridges.
 
@@ -1571,7 +1572,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         return torch.stack(node_values, dim=0)
 
     def add_box_shell_corners(self, nodes_uv: torch.Tensor, node_alpha: torch.Tensor, node_type: torch.Tensor, node_seed_triples: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_source_type: torch.Tensor, tol: float=0.0001) -> dict[str, torch.Tensor]:
-        """Append missing UV-box corners used by retained shell edges (source type 4)."""
+        """Append missing UV-box corners as boundary shell nodes (source type 4)."""
         device, dtype = (nodes_uv.device, nodes_uv.dtype)
         corners = torch.tensor([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=dtype, device=device)
         missing = []
@@ -1585,7 +1586,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         return {'nodes_uv': torch.cat((nodes_uv, added), dim=0), 'node_alpha': torch.cat((node_alpha, torch.ones(count, dtype=dtype, device=device))), 'node_type': torch.cat((node_type, torch.ones(count, dtype=torch.long, device=device))), 'node_seed_triples': torch.cat((node_seed_triples, torch.full((count, 3), -1, dtype=torch.long, device=device))), 'boundary_seed_pair': torch.cat((boundary_seed_pair, torch.full((count, 2), -1, dtype=torch.long, device=device))), 'boundary_source_type': torch.cat((boundary_source_type, torch.full((count,), 4, dtype=torch.long, device=device)))}
 
     def add_cad_boundary_curve_endpoints(self, nodes_uv: torch.Tensor, node_alpha: torch.Tensor, node_type: torch.Tensor, node_seed_triples: torch.Tensor, boundary_seed_pair: torch.Tensor, boundary_source_type: torch.Tensor, cad_domain: Any | None=None, tol: float=1e-06) -> dict[str, torch.Tensor]:
-        """Append CAD boundary C1-piece endpoints used by retained shell edges (source type 6)."""
+        """Append CAD boundary C1-piece endpoints as shell nodes (source type 6)."""
         if cad_domain is None:
             return {'nodes_uv': nodes_uv, 'node_alpha': node_alpha, 'node_type': node_type, 'node_seed_triples': node_seed_triples, 'boundary_seed_pair': boundary_seed_pair, 'boundary_source_type': boundary_source_type}
         boundary_uv = None
@@ -1633,7 +1634,7 @@ class ContinuousVoronoiDecoder(nn.Module):
         return {'nodes_uv': torch.cat((nodes_uv, added), dim=0), 'node_alpha': torch.cat((node_alpha, torch.ones((count,), dtype=nodes_uv.dtype, device=nodes_uv.device))), 'node_type': torch.cat((node_type, torch.ones((count,), dtype=torch.long, device=nodes_uv.device))), 'node_seed_triples': torch.cat((node_seed_triples, torch.full((count, 3), -1, dtype=torch.long, device=nodes_uv.device))), 'boundary_seed_pair': torch.cat((boundary_seed_pair, torch.full((count, 2), -1, dtype=torch.long, device=nodes_uv.device))), 'boundary_source_type': torch.cat((boundary_source_type, torch.full((count,), 6, dtype=torch.long, device=nodes_uv.device)))}
 
     def build_boundary_loop_edges(self, nodes_uv: torch.Tensor, vertex_type: torch.Tensor, cad_domain: Any | None=None, tol: float=0.0001) -> tuple[torch.Tensor, torch.Tensor]:
-        """Connect boundary nodes cyclically as shell edges for CAD/box curve sampling."""
+        """Connect boundary nodes cyclically in shell-parameter order."""
         device = nodes_uv.device
         boundary_ids = torch.nonzero(vertex_type == 1, as_tuple=False).flatten()
         if boundary_ids.numel() < 2:
@@ -1744,7 +1745,7 @@ class ContinuousVoronoiDecoder(nn.Module):
                 delaunay_triples_np = Delaunay(seeds_uv.detach().cpu().numpy()).simplices
             except Exception:
                 delaunay_triples_np = np.empty((0, 3), dtype=np.int64)
-        vertices_uv = self.differentiable_vertices_from_topology(seeds_uv=seeds_uv, vertex_type=topo['vertex_type'], vertex_seed_triples=topo['vertex_seed_triples'], u_periodic=u_periodic, v_periodic=v_periodic, cad_domain=cad_domain, boundary_source_type=topo['boundary_source_type'], topology_vertices_uv=topo.get('vertices_uv'), node_clip_source_vertices=topo.get('node_clip_source_vertices'), scipy_vertex_aug_seed_triples=topo.get('scipy_vertex_aug_seed_triples'), guard_seeds_uv=topo.get('guard_seeds_uv'), node_trim_segment_uv=topo.get('node_trim_segment_uv'))
+        vertices_uv = self.differentiable_vertices_from_topology(seeds_uv=seeds_uv, vertex_type=topo['vertex_type'],  boundary_source_type=topo['boundary_source_type'], topology_vertices_uv=topo.get('vertices_uv'), node_clip_source_vertices=topo.get('node_clip_source_vertices'), scipy_vertex_aug_seed_triples=topo.get('scipy_vertex_aug_seed_triples'), guard_seeds_uv=topo.get('guard_seeds_uv'), node_trim_segment_uv=topo.get('node_trim_segment_uv'))
         # node_alpha is a soft validity/activity weight for edge/tube activity;
         # it is not used for topology trimming.
         alpha = torch.ones((vertices_uv.shape[0],), dtype=seeds_uv.dtype, device=seeds_uv.device)
@@ -1925,6 +1926,7 @@ class ContinuousVoronoiDecoder(nn.Module):
             use_u_periodic = self._bool_value(self.face_u_periodic)
             use_v_periodic = self._bool_value(self.face_v_periodic)
             cad_domain =self.Cad_domain
+            #scipy_smooth_start = perf_counter()
             topo_out = self.forward_scipy_topology(
                 seeds_uv=seeds_uv,
                 cad_domain=cad_domain,
@@ -1933,6 +1935,7 @@ class ContinuousVoronoiDecoder(nn.Module):
                 return_xyz=self.return_xyz,
                 keep_isolated_vertices=False,
             )
+            #print(f"scipy+smooth took {perf_counter() - scipy_smooth_start:.6f}s")
             w_geo = self.width(w_raw, seeds=seeds_uv)
             width_uv = self._pair_upper_mean(w_geo)
             local_scale = self._local_uv_to_xyz_scale(Xu, Xv, points_3d)
