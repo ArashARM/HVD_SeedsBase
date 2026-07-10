@@ -7,6 +7,51 @@ from Decoder_CLasses.ContinuousVoronoiDecoder import ContinuousVoronoiDecoder
 from Training.MainTrain import NN_Trainer, TrainingConfig
 
 
+def make_decoder(**kwargs):
+    face_mesh = {
+        "uv": torch.empty((0, 2)),
+        "Xu": None,
+        "Xv": None,
+        "points_xyz": None,
+    }
+    return ContinuousVoronoiDecoder(None, face_mesh, **kwargs)
+
+
+def test_curve_length_loss_filters_to_configured_edge_types() -> None:
+    trainer = NN_Trainer.__new__(NN_Trainer)
+    trainer.cfg = TrainingConfig(
+        curve_length_equal_edge_types=(0,),
+        curve_length_report_edge_types=(0,),
+    )
+    edge_curves_xyz = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [1.2, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [0.02, 0.0, 0.0]],
+            [[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    decoder_out = {
+        "edge_curves_xyz": edge_curves_xyz,
+        "graph": {
+            "edge_type": torch.tensor([0, 0, 1, 4], dtype=torch.long),
+        },
+    }
+
+    filtered = trainer.curve_3d_edge_lengths(decoder_out, edge_types=(0,))
+    unfiltered = trainer.curve_3d_edge_lengths(decoder_out, include_shell_edges=True)
+    loss = trainer.curve_length_similarity_loss(decoder_out)
+
+    assert torch.allclose(filtered, edge_curves_xyz.new_tensor([1.0, 1.2]))
+    assert torch.allclose(unfiltered, edge_curves_xyz.new_tensor([1.0, 1.2, 0.02, 8.0]))
+    assert loss < edge_curves_xyz.new_tensor(100.0)
+    loss.backward()
+    assert edge_curves_xyz.grad is not None
+    assert torch.isfinite(edge_curves_xyz.grad[:2]).all()
+
+
 class DummyVoronoiSeedTrainer(nn.Module):
     """Optimize seed positions while rebuilding hard SciPy topology each step."""
 
@@ -287,22 +332,32 @@ def test_smooth_edge_curves_xyz_uses_torch_cad_evaluator() -> None:
     assert torch.isfinite(curves_uv.grad).all()
 
 
-def test_boundary_box_edge_sampling_stays_on_box_boundary() -> None:
-    decoder = ContinuousVoronoiDecoder(return_xyz=False)
+def test_square_boundary_edge_sampling_uses_boundary_support() -> None:
+    decoder = make_decoder(return_xyz=False)
     dtype = torch.float64
-
-    same_side = decoder.sample_boundary_box_edge_uv(
+    graph = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=dtype,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
+    }
+    same_side = decoder.sample_cad_boundary_edge_uv(
         torch.tensor([0.0, 0.2], dtype=dtype),
         torch.tensor([0.0, 0.8], dtype=dtype),
+        graph=graph,
         n_samples=17,
     )
-    around_corner = decoder.sample_boundary_box_edge_uv(
+    around_corner = decoder.sample_cad_boundary_edge_uv(
         torch.tensor([0.0, 0.4], dtype=dtype),
         torch.tensor([0.7, 0.0], dtype=dtype),
+        graph=graph,
         n_samples=18,
     )
 
     for curve in (same_side, around_corner):
+        assert curve is not None
         on_boundary = (
             torch.isclose(curve[:, 0], torch.zeros_like(curve[:, 0]), atol=1e-5)
             | torch.isclose(curve[:, 0], torch.ones_like(curve[:, 0]), atol=1e-5)
@@ -312,8 +367,8 @@ def test_boundary_box_edge_sampling_stays_on_box_boundary() -> None:
         assert on_boundary.all()
 
 
-def test_graph_edge_curve_sampling_dispatches_only_shell_edges_to_box() -> None:
-    decoder = ContinuousVoronoiDecoder(return_xyz=False)
+def test_graph_edge_curve_sampling_dispatches_only_shell_edges_to_boundary_support() -> None:
+    decoder = make_decoder(return_xyz=False)
     seeds = torch.tensor(
         [[0.2, 0.3], [0.8, 0.3]], dtype=torch.float64, requires_grad=True
     )
@@ -325,6 +380,12 @@ def test_graph_edge_curve_sampling_dispatches_only_shell_edges_to_box() -> None:
         "edge_index": torch.tensor([[0, 1], [2, 0]], dtype=torch.long),
         "edge_seed_pair": torch.tensor([[-1, -1], [0, 1]], dtype=torch.long),
         "edge_type": torch.tensor([4, 1], dtype=torch.long),
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+        "boundary_curve_loop_id": torch.zeros((4,), dtype=torch.long),
     }
 
     curves = decoder.sample_graph_edge_curves_uv(seeds, graph, n_samples=32)
@@ -729,7 +790,6 @@ def test_cell_edge_uniformity_loss_groups_edges_per_cell() -> None:
                 [[0, 1], [0, 2], [0, 3], [1, 2]],
                 dtype=torch.long,
             ),
-            "edge_alpha": torch.ones(4, dtype=torch.float64),
         },
     }
 
@@ -768,7 +828,6 @@ def test_cell_edge_uniformity_loss_penalizes_per_cell_angles() -> None:
                 [[0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6]],
                 dtype=torch.long,
             ),
-            "edge_alpha": torch.ones(6, dtype=torch.float64),
         },
     }
 

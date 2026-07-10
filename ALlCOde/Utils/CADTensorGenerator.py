@@ -1,0 +1,1423 @@
+import os
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from OCC.Core.STEPControl import STEPControl_Reader
+from OCC.Core.IGESControl import IGESControl_Reader
+from OCC.Core.IFSelect import IFSelect_RetDone
+from OCC.Core.TopExp import TopExp_Explorer
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_IN, TopAbs_ON, TopAbs_REVERSED, TopAbs_WIRE
+from OCC.Core.TopoDS import topods
+from OCC.Core.BRepAdaptor import BRepAdaptor_Curve2d, BRepAdaptor_Surface
+from OCC.Core.BRepTools import BRepTools_WireExplorer, breptools
+from OCC.Core.BRep import BRep_Tool
+from OCC.Core.gp import gp_Pnt2d
+from OCC.Core.GeomLProp import GeomLProp_SLProps
+from OCC.Core.BRepClass import BRepClass_FaceClassifier
+from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.BRepBndLib import brepbndlib
+
+try:
+    from scipy.ndimage import distance_transform_edt
+except Exception:
+    distance_transform_edt = None
+
+try:
+    import gmsh
+except Exception:
+    gmsh = None
+
+
+class _OCCSurfaceEvaluation(torch.autograd.Function):
+    """Torch autograd bridge for a fixed OpenCascade parametric surface.
+
+    OpenCascade chooses/evaluates the CAD representation outside Torch. Its
+    exact first surface derivatives provide the local Jacobian used in the
+    backward pass, so gradients flow from XYZ back to normalized UV.
+    """
+
+    @staticmethod
+    def forward(ctx, uv_norm: torch.Tensor, cad_domain):
+        cad_domain._require_active_face()
+        if uv_norm.ndim != 2 or uv_norm.shape[-1] != 2:
+            raise ValueError("uv_norm must have shape [N, 2].")
+        if not uv_norm.is_floating_point():
+            raise TypeError("uv_norm must be a floating point tensor.")
+
+        uv_raw = cad_domain.uv_norm_to_raw_from_bounds(
+            uv_norm.detach().cpu().numpy(),
+            u_raw_bounds=cad_domain._active_u_raw_bounds,
+            v_raw_bounds=cad_domain._active_v_raw_bounds,
+        )
+        xyz = np.empty((uv_raw.shape[0], 3), dtype=np.float64)
+        xu_norm = np.empty_like(xyz)
+        xv_norm = np.empty_like(xyz)
+        u_scale = (
+            cad_domain._active_u_raw_bounds[1]
+            - cad_domain._active_u_raw_bounds[0]
+        )
+        v_scale = (
+            cad_domain._active_v_raw_bounds[1]
+            - cad_domain._active_v_raw_bounds[0]
+        )
+
+        for index, (u, v) in enumerate(uv_raw):
+            props = GeomLProp_SLProps(
+                cad_domain._active_surface,
+                float(u),
+                float(v),
+                1,
+                cad_domain.metric_tol,
+            )
+            point = props.Value()
+            du = props.D1U()
+            dv = props.D1V()
+            xyz[index] = (point.X(), point.Y(), point.Z())
+            xu_norm[index] = (
+                du.X() * u_scale,
+                du.Y() * u_scale,
+                du.Z() * u_scale,
+            )
+            xv_norm[index] = (
+                dv.X() * v_scale,
+                dv.Y() * v_scale,
+                dv.Z() * v_scale,
+            )
+
+        xyz_t = torch.as_tensor(xyz, dtype=uv_norm.dtype, device=uv_norm.device)
+        xu_t = torch.as_tensor(xu_norm, dtype=uv_norm.dtype, device=uv_norm.device)
+        xv_t = torch.as_tensor(xv_norm, dtype=uv_norm.dtype, device=uv_norm.device)
+        ctx.save_for_backward(xu_t, xv_t)
+        return xyz_t
+
+    @staticmethod
+    def backward(ctx, grad_xyz: torch.Tensor):
+        xu_norm, xv_norm = ctx.saved_tensors
+        grad_u = (grad_xyz * xu_norm).sum(dim=-1)
+        grad_v = (grad_xyz * xv_norm).sum(dim=-1)
+        return torch.stack((grad_u, grad_v), dim=-1), None
+
+
+class CADTensorGenerator:
+    """
+    Single-face CAD UV-domain provider for decoder optimization.
+
+    The loaded CAD file must contain exactly one TopoDS_Face. The decoder owns
+    seed variables in normalized UV [0, 1]^2 and calls this class for trim SDF
+    access plus continuous UV-to-XYZ and metric evaluation.
+    """
+
+    def __init__(
+        self,
+        shape_path: str | None = None,
+        metric_tol: float = 1e-9,
+        device: str = "cpu",
+        seed_domain_mask_res: int = 128,
+        seed_domain_trim_tol: float = 1e-7,
+        mesh_n_u: int = 80,
+        mesh_n_v: int = 40,
+        mesh_size_scale: float = 1.0,
+        mesh_algorithm: int = 6,
+        boundary_c1_angle_tol_degrees: float = 45.0,
+        boundary_min_piece_points: int = 2,
+        boundary_edge_samples: int = 33,
+    ):
+        self.shape_path = None if shape_path is None else os.fspath(shape_path)
+        self.metric_tol = float(metric_tol)
+        self.device = device
+        self.seed_domain_mask_res = int(seed_domain_mask_res)
+        self.seed_domain_trim_tol = float(seed_domain_trim_tol)
+        self.mesh_n_u = int(mesh_n_u)
+        self.mesh_n_v = int(mesh_n_v)
+        self.mesh_size_scale = float(mesh_size_scale)
+        self.mesh_algorithm = int(mesh_algorithm)
+        self.boundary_c1_angle_tol_degrees = float(boundary_c1_angle_tol_degrees)
+        self.boundary_min_piece_points = max(2, int(boundary_min_piece_points))
+        self.boundary_edge_samples = max(2, int(boundary_edge_samples))
+
+        self._active_shape = None
+        self._active_face = None
+        self._active_surface = None
+        self._active_u_raw_bounds = None
+        self._active_v_raw_bounds = None
+        self._seed_domain_mask_grid = None
+        self._seed_domain_sdf_grid = None
+        self._boundary_parameter_loops = None
+        self._boundary_curve_pieces = None
+        self._boundary_curve_tensors_cache = None
+        self._u_periodic = False
+        self._v_periodic = False
+        self._u_period = None
+        self._v_period = None
+        self._active_shape_path = None
+        self._shell_tensors_cache = None
+        self._shell_mesh_cache_key = None
+
+    # =========================================================================
+    # 1) CAD loading + single-face helpers
+    # =========================================================================
+
+    @staticmethod
+    def load_shape(path: str):
+        """Load STEP/IGES into a TopoDS_Shape."""
+        p = os.fspath(path).lower()
+
+        if p.endswith((".step", ".stp")):
+            reader = STEPControl_Reader()
+            if reader.ReadFile(os.fspath(path)) != IFSelect_RetDone:
+                raise RuntimeError("STEP read failed")
+            reader.TransferRoots()
+            return reader.OneShape()
+
+        if p.endswith((".iges", ".igs")):
+            reader = IGESControl_Reader()
+            if reader.ReadFile(os.fspath(path)) != IFSelect_RetDone:
+                raise RuntimeError("IGES read failed")
+            reader.TransferRoots()
+            return reader.OneShape()
+
+        raise ValueError("Unsupported file type (need .step/.stp/.iges/.igs)")
+
+    @staticmethod
+    def iter_faces(shape):
+        """Yield TopoDS_Face items in OpenCascade traversal order."""
+        exp = TopExp_Explorer(shape, TopAbs_FACE)
+        while exp.More():
+            yield topods.Face(exp.Current())
+            exp.Next()
+
+    @classmethod
+    def get_single_face(cls, shape):
+        faces = list(cls.iter_faces(shape))
+        if len(faces) != 1:
+            raise ValueError(f"Expected CAD file with exactly one face, got {len(faces)}.")
+        return faces[0]
+
+    @staticmethod
+    def face_uv_bounds_and_surface(face):
+        """Return (umin, umax, vmin, vmax) and the underlying OCC surface."""
+        umin, umax, vmin, vmax = breptools.UVBounds(face)
+        surf = BRep_Tool.Surface(face)
+        return (float(umin), float(umax), float(vmin), float(vmax)), surf
+
+    @staticmethod
+    def face_uv_periodicity(face):
+        """Return periodicity for the underlying OCC surface."""
+        surf_ad = BRepAdaptor_Surface(face, False)
+        u_per = bool(surf_ad.IsUPeriodic())
+        v_per = bool(surf_ad.IsVPeriodic())
+        u_period = float(surf_ad.UPeriod()) if u_per else None
+        v_period = float(surf_ad.VPeriod()) if v_per else None
+        return u_per, v_per, u_period, v_period
+
+    def _require_active_face(self):
+        if self._active_face is None:
+            raise RuntimeError("Call generate_from_file(shape_path) before evaluating UV points.")
+        return self._active_face
+
+    # =========================================================================
+    # 2) UV conversion + periodic helpers
+    # =========================================================================
+
+    @staticmethod
+    def uv_raw_to_norm(u, v, umin, umax, vmin, vmax):
+        Lu = float(umax - umin)
+        Lv = float(vmax - vmin)
+        if abs(Lu) < 1e-30:
+            Lu = 1.0
+        if abs(Lv) < 1e-30:
+            Lv = 1.0
+        return (float(u) - float(umin)) / Lu, (float(v) - float(vmin)) / Lv
+
+    @staticmethod
+    def uv_norm_to_raw_from_bounds(
+        uv_norm,
+        u_raw_bounds: tuple[float, float],
+        v_raw_bounds: tuple[float, float],
+    ):
+        """Convert normalized UV in [0,1]^2 to raw CAD face UV."""
+        umin, umax = map(float, u_raw_bounds)
+        vmin, vmax = map(float, v_raw_bounds)
+
+        if isinstance(uv_norm, torch.Tensor):
+            u = umin + uv_norm[..., 0] * (umax - umin)
+            v = vmin + uv_norm[..., 1] * (vmax - vmin)
+            return torch.stack((u, v), dim=-1)
+
+        uv_norm = np.asarray(uv_norm, dtype=float)
+        u = umin + uv_norm[..., 0] * (umax - umin)
+        v = vmin + uv_norm[..., 1] * (vmax - vmin)
+        return np.stack((u, v), axis=-1)
+
+    @staticmethod
+    def uv_raw_to_norm_from_bounds(
+        uv_raw,
+        u_raw_bounds: tuple[float, float],
+        v_raw_bounds: tuple[float, float],
+    ):
+        """Convert raw CAD UV to normalized UV in [0,1]^2."""
+        umin, umax = map(float, u_raw_bounds)
+        vmin, vmax = map(float, v_raw_bounds)
+        Lu = (umax - umin) if abs(umax - umin) > 1e-30 else 1.0
+        Lv = (vmax - vmin) if abs(vmax - vmin) > 1e-30 else 1.0
+
+        if isinstance(uv_raw, torch.Tensor):
+            u = (uv_raw[..., 0] - umin) / Lu
+            v = (uv_raw[..., 1] - vmin) / Lv
+            return torch.stack((u, v), dim=-1)
+
+        uv_raw = np.asarray(uv_raw, dtype=float)
+        u = (uv_raw[..., 0] - umin) / Lu
+        v = (uv_raw[..., 1] - vmin) / Lv
+        return np.stack((u, v), axis=-1)
+
+    @staticmethod
+    def periodic_uv_difference(
+        uv_a,
+        uv_b,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+    ):
+        """Difference in normalized UV, wrapping periodic dimensions."""
+        diff = uv_a - uv_b
+        round_fn = torch.round if isinstance(diff, torch.Tensor) else np.round
+        if u_periodic:
+            diff = diff.clone() if isinstance(diff, torch.Tensor) else diff.copy()
+            diff[..., 0] = diff[..., 0] - round_fn(diff[..., 0])
+        if v_periodic:
+            diff = diff.clone() if isinstance(diff, torch.Tensor) else diff.copy()
+            diff[..., 1] = diff[..., 1] - round_fn(diff[..., 1])
+        return diff
+
+    @staticmethod
+    def periodic_uv_distance(
+        uv_a,
+        uv_b,
+        u_periodic: bool = False,
+        v_periodic: bool = False,
+        eps: float = 1e-12,
+    ):
+        """Euclidean distance in normalized UV, wrapping periodic dimensions."""
+        diff = CADTensorGenerator.periodic_uv_difference(
+            uv_a,
+            uv_b,
+            u_periodic=u_periodic,
+            v_periodic=v_periodic,
+        )
+        if isinstance(diff, torch.Tensor):
+            return torch.sqrt((diff * diff).sum(dim=-1) + float(eps))
+        return np.sqrt((diff * diff).sum(axis=-1) + float(eps))
+
+    # =========================================================================
+    # 3) Trim classification, mask, and SDF
+    # =========================================================================
+
+    @staticmethod
+    def _classify_inside(face, u, v, classifier, tol):
+        classifier.Perform(face, gp_Pnt2d(float(u), float(v)), float(tol))
+        st = classifier.State()
+        return (st == TopAbs_IN) or (st == TopAbs_ON)
+
+    @classmethod
+    def classify_uv_points_on_face(
+        cls,
+        face,
+        uv_raw,
+        tol: float = 1e-7,
+    ) -> np.ndarray:
+        """Trim-aware inside mask for raw UV points on a CAD face."""
+        if isinstance(uv_raw, torch.Tensor):
+            uv_raw = uv_raw.detach().cpu().numpy()
+        uv_raw = np.asarray(uv_raw, dtype=float)
+        if uv_raw.shape[-1] != 2:
+            raise ValueError(f"uv_raw must end with dimension 2, got {uv_raw.shape}")
+
+        flat = uv_raw.reshape(-1, 2)
+        classifier = BRepClass_FaceClassifier()
+        inside = np.zeros((flat.shape[0],), dtype=bool)
+        for i, (u, v) in enumerate(flat):
+            inside[i] = cls._classify_inside(face, float(u), float(v), classifier, tol)
+        return inside.reshape(uv_raw.shape[:-1])
+
+    @classmethod
+    def build_seed_domain_mask_grid(
+        cls,
+        face,
+        u_raw_bounds: tuple[float, float],
+        v_raw_bounds: tuple[float, float],
+        res: int = 128,
+        trim_tol: float = 1e-7,
+    ) -> np.ndarray:
+        """Build a binary trim-validity mask on a normalized [0,1]^2 grid."""
+        res = int(res)
+        if res < 2:
+            raise ValueError(f"seed domain mask resolution must be >= 2, got {res}")
+
+        u_lin = np.linspace(0.0, 1.0, res, dtype=np.float32)
+        v_lin = np.linspace(0.0, 1.0, res, dtype=np.float32)
+        uu, vv = np.meshgrid(u_lin, v_lin, indexing="xy")
+        uv_norm = np.stack([uu.reshape(-1), vv.reshape(-1)], axis=1)
+        uv_raw = cls.uv_norm_to_raw_from_bounds(
+            uv_norm=uv_norm,
+            u_raw_bounds=u_raw_bounds,
+            v_raw_bounds=v_raw_bounds,
+        )
+        inside = cls.classify_uv_points_on_face(face, uv_raw, tol=trim_tol)
+        return inside.astype(np.float32).reshape(res, res)
+    
+    @staticmethod
+    def build_seed_domain_sdf_grid(mask_grid_np: np.ndarray) -> np.ndarray:
+        """Signed distance to nearest invalid/valid boundary in normalized UV units."""
+        if distance_transform_edt is None:
+            raise ImportError("scipy.ndimage.distance_transform_edt is required for trim SDF grids.")
+
+        mask_grid_np = np.asarray(mask_grid_np, dtype=np.float32)
+        if mask_grid_np.ndim != 2 or mask_grid_np.shape[0] != mask_grid_np.shape[1]:
+            raise ValueError(f"mask_grid_np must be square [res,res], got {mask_grid_np.shape}")
+
+        res = int(mask_grid_np.shape[0])
+        dx = 1.0 / float(res - 1)
+        inside = mask_grid_np > 0.5
+
+        yy, xx = np.mgrid[0:res, 0:res]
+        u = xx / float(res - 1)
+        v = yy / float(res - 1)
+
+        box_dist = np.minimum.reduce([
+            u,
+            1.0 - u,
+            v,
+            1.0 - v,
+        ])
+
+        if np.all(inside):
+            return box_dist.astype(np.float32)
+
+        if not np.any(inside):
+            return (-box_dist).astype(np.float32)
+
+        dist_to_outside = distance_transform_edt(inside) * dx
+        dist_to_inside = distance_transform_edt(~inside) * dx
+
+        sdf = dist_to_outside - dist_to_inside
+
+        sdf = np.minimum(sdf, box_dist)
+
+        return sdf.astype(np.float32)
+
+    def _build_boundary_parameter_loops(self) -> list[np.ndarray]:
+        """Extract ordered normalized-UV trim loops from the cached SDF grid."""
+        if self._seed_domain_sdf_grid is None:
+            raise RuntimeError("Call generate_from_file(shape_path) before extracting trim loops.")
+
+        # Matplotlib's contour engine gives ordered polylines and correctly
+        # separates the outer trim wire from any inner-hole wires.
+        from matplotlib.figure import Figure
+
+        sdf = self._seed_domain_sdf_grid.detach().cpu().numpy()
+        height, width = sdf.shape
+        u = np.linspace(0.0, 1.0, width)
+        v = np.linspace(0.0, 1.0, height)
+        figure = Figure()
+        axis = figure.subplots()
+        contour = axis.contour(u, v, sdf, levels=[0.0])
+        loops = [
+            np.asarray(segment, dtype=np.float64)
+            for segment in contour.allsegs[0]
+            if np.asarray(segment).shape[0] >= 2
+        ]
+        figure.clear()
+
+        if not loops:
+            raise RuntimeError(
+                "No trim-boundary loops could be extracted from the CAD SDF grid."
+            )
+        self._boundary_parameter_loops = loops
+        return loops
+
+    @staticmethod
+    def _signed_loop_area_uv(loop: np.ndarray) -> float:
+        """Signed polygon area in normalized UV."""
+        loop = np.asarray(loop, dtype=np.float64)
+        if loop.shape[0] < 3:
+            return 0.0
+        if np.linalg.norm(loop[0] - loop[-1]) > 1e-12:
+            loop = np.concatenate((loop, loop[:1]), axis=0)
+        x = loop[:, 0]
+        y = loop[:, 1]
+        return float(0.5 * np.sum(x[:-1] * y[1:] - x[1:] * y[:-1]))
+
+    @staticmethod
+    def _polyline_arclength(points: np.ndarray) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float64)
+        if points.shape[0] == 0:
+            return np.zeros((0,), dtype=np.float64)
+        if points.shape[0] == 1:
+            return np.zeros((1,), dtype=np.float64)
+        lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        return np.concatenate(([0.0], np.cumsum(lengths)))
+
+    def _split_loop_at_c1_breaks(self, loop: np.ndarray) -> list[np.ndarray]:
+        """Split a closed trim loop into approximately C1-continuous polyline pieces."""
+        loop = np.asarray(loop, dtype=np.float64)
+        if loop.ndim != 2 or loop.shape[1] != 2 or loop.shape[0] < 2:
+            return []
+        is_closed = bool(np.linalg.norm(loop[0] - loop[-1]) <= 1e-12)
+        if is_closed:
+            loop_open = loop[:-1]
+        else:
+            loop_open = loop
+        n = int(loop_open.shape[0])
+        if n < self.boundary_min_piece_points:
+            return []
+
+        if not is_closed and n <= 2:
+            return [loop_open]
+
+        prev_vec = loop_open - np.roll(loop_open, 1, axis=0)
+        next_vec = np.roll(loop_open, -1, axis=0) - loop_open
+        prev_len = np.linalg.norm(prev_vec, axis=1)
+        next_len = np.linalg.norm(next_vec, axis=1)
+        valid = (prev_len > 1e-12) & (next_len > 1e-12)
+        if not is_closed:
+            valid[0] = False
+            valid[-1] = False
+        cos_angle = np.ones((n,), dtype=np.float64)
+        cos_angle[valid] = np.sum(prev_vec[valid] * next_vec[valid], axis=1) / (
+            prev_len[valid] * next_len[valid]
+        )
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        turn_angle = np.arccos(cos_angle)
+        angle_tol = np.deg2rad(max(float(self.boundary_c1_angle_tol_degrees), 0.0))
+        break_ids = np.nonzero(valid & (turn_angle > angle_tol))[0].tolist()
+
+        if not break_ids:
+            return [np.concatenate((loop_open, loop_open[:1]), axis=0)] if is_closed else [loop_open]
+
+        break_ids = sorted(set(int(i) for i in break_ids))
+        pieces: list[np.ndarray] = []
+        if is_closed:
+            for local_id, start in enumerate(break_ids):
+                end = break_ids[(local_id + 1) % len(break_ids)]
+                if end <= start:
+                    ids = list(range(start, n)) + list(range(0, end + 1))
+                else:
+                    ids = list(range(start, end + 1))
+                piece = loop_open[np.asarray(ids, dtype=np.int64)]
+                if piece.shape[0] >= self.boundary_min_piece_points:
+                    pieces.append(piece)
+        else:
+            cut_ids = [0] + break_ids + [n - 1]
+            for start, end in zip(cut_ids[:-1], cut_ids[1:]):
+                piece = loop_open[start : end + 1]
+                if piece.shape[0] >= self.boundary_min_piece_points:
+                    pieces.append(piece)
+        if not pieces:
+            return [np.concatenate((loop_open, loop_open[:1]), axis=0)] if is_closed else [loop_open]
+        return pieces
+
+    def _sample_edge_uv_norm(self, edge, face) -> np.ndarray:
+        curve = BRepAdaptor_Curve2d(edge, face)
+        t0 = float(curve.FirstParameter())
+        t1 = float(curve.LastParameter())
+        if edge.Orientation() == TopAbs_REVERSED:
+            t = np.linspace(t1, t0, self.boundary_edge_samples)
+        else:
+            t = np.linspace(t0, t1, self.boundary_edge_samples)
+        raw = np.empty((t.shape[0], 2), dtype=np.float64)
+        for index, value in enumerate(t):
+            point = curve.Value(float(value))
+            raw[index] = (point.X(), point.Y())
+        uv = self.uv_raw_to_norm_from_bounds(
+            raw,
+            u_raw_bounds=self._active_u_raw_bounds,
+            v_raw_bounds=self._active_v_raw_bounds,
+        )
+        uv = np.clip(np.asarray(uv, dtype=np.float64), 0.0, 1.0)
+        keep = np.ones((uv.shape[0],), dtype=bool)
+        if uv.shape[0] > 1:
+            keep[1:] = np.linalg.norm(np.diff(uv, axis=0), axis=1) > 1e-12
+        return uv[keep]
+
+    def _build_cad_boundary_curve_pieces(self) -> list[dict]:
+        """Extract topological trim edges from OpenCascade as UV curve pieces."""
+        self._require_active_face()
+        pieces: list[dict] = []
+        wire_exp = TopExp_Explorer(self._active_face, TopAbs_WIRE)
+        loop_id = 0
+        while wire_exp.More():
+            wire = topods.Wire(wire_exp.Current())
+            wire_explorer = BRepTools_WireExplorer(wire, self._active_face)
+            edge_samples: list[np.ndarray] = []
+            while wire_explorer.More():
+                edge = topods.Edge(wire_explorer.Current())
+                uv = self._sample_edge_uv_norm(edge, self._active_face)
+                if uv.shape[0] >= self.boundary_min_piece_points:
+                    if edge_samples:
+                        prev_end = edge_samples[-1][-1]
+                        forward_gap = np.linalg.norm(uv[0] - prev_end)
+                        reverse_gap = np.linalg.norm(uv[-1] - prev_end)
+                        if reverse_gap < forward_gap:
+                            uv = uv[::-1].copy()
+                    edge_samples.append(uv)
+                wire_explorer.Next()
+
+            if not edge_samples:
+                wire_exp.Next()
+                loop_id += 1
+                continue
+
+            loop_points = []
+            for edge_id, uv in enumerate(edge_samples):
+                loop_points.append(uv if edge_id == 0 else uv[1:])
+            loop = np.concatenate(loop_points, axis=0)
+            area = self._signed_loop_area_uv(loop)
+            loop_kind = "outer" if area >= 0.0 else "hole"
+
+            for piece_id, points in enumerate(self._split_loop_at_c1_breaks(loop)):
+                arclength = self._polyline_arclength(points)
+                pieces.append(
+                    {
+                        "uv": points,
+                        "loop_id": int(loop_id),
+                        "piece_id_in_loop": int(piece_id),
+                        "loop_kind": loop_kind,
+                        "loop_area": float(area),
+                        "arclength": arclength,
+                        "length": float(arclength[-1]) if arclength.size else 0.0,
+                        "is_closed_loop_piece": bool(
+                            points.shape[0] > 2 and np.linalg.norm(points[0] - points[-1]) <= 1e-12
+                        ),
+                    }
+                )
+
+            wire_exp.Next()
+            loop_id += 1
+
+        if not pieces:
+            raise RuntimeError("No OpenCascade trim-edge UV curves could be extracted.")
+        return pieces
+
+    def build_boundary_curve_pieces(self) -> list[dict]:
+        """Return C1-split trim-boundary curve pieces in normalized UV."""
+        if self._boundary_curve_pieces is not None:
+            return self._boundary_curve_pieces
+        if self._active_face is not None:
+            try:
+                self._boundary_curve_pieces = self._build_cad_boundary_curve_pieces()
+                return self._boundary_curve_pieces
+            except Exception:
+                pass
+        loops = self._boundary_parameter_loops
+        if loops is None:
+            loops = self._build_boundary_parameter_loops()
+
+        pieces: list[dict] = []
+        for loop_id, loop in enumerate(loops):
+            loop = np.asarray(loop, dtype=np.float64)
+            area = self._signed_loop_area_uv(loop)
+            loop_kind = "outer" if area >= 0.0 else "hole"
+            split = self._split_loop_at_c1_breaks(loop)
+            for piece_id, points in enumerate(split):
+                arclength = self._polyline_arclength(points)
+                pieces.append(
+                    {
+                        "uv": points,
+                        "loop_id": int(loop_id),
+                        "piece_id_in_loop": int(piece_id),
+                        "loop_kind": loop_kind,
+                        "loop_area": float(area),
+                        "arclength": arclength,
+                        "length": float(arclength[-1]) if arclength.size else 0.0,
+                        "is_closed_loop_piece": bool(
+                            points.shape[0] > 2 and np.linalg.norm(points[0] - points[-1]) <= 1e-12
+                        ),
+                    }
+                )
+
+        self._boundary_curve_pieces = pieces
+        return pieces
+
+    def boundary_curve_tensors(self, as_torch: bool = True) -> dict:
+        """Packed C1-split trim curves for topology clipping and visualization."""
+        if as_torch and self._boundary_curve_tensors_cache is not None:
+            return self._boundary_curve_tensors_cache
+
+        pieces = self.build_boundary_curve_pieces()
+        offsets = [0]
+        uv_parts = []
+        arclength_parts = []
+        loop_ids = []
+        piece_ids = []
+        loop_kind_ids = []
+        loop_areas = []
+        lengths = []
+        closed_flags = []
+
+        for piece in pieces:
+            uv = np.asarray(piece["uv"], dtype=np.float64)
+            arclength = np.asarray(piece["arclength"], dtype=np.float64)
+            uv_parts.append(uv)
+            arclength_parts.append(arclength)
+            offsets.append(offsets[-1] + int(uv.shape[0]))
+            loop_ids.append(int(piece["loop_id"]))
+            piece_ids.append(int(piece["piece_id_in_loop"]))
+            loop_kind_ids.append(0 if piece["loop_kind"] == "outer" else 1)
+            loop_areas.append(float(piece["loop_area"]))
+            lengths.append(float(piece["length"]))
+            closed_flags.append(bool(piece["is_closed_loop_piece"]))
+
+        if uv_parts:
+            uv_np = np.concatenate(uv_parts, axis=0)
+            arclength_np = np.concatenate(arclength_parts, axis=0)
+        else:
+            uv_np = np.empty((0, 2), dtype=np.float64)
+            arclength_np = np.empty((0,), dtype=np.float64)
+
+        data_np = {
+            "boundary_curve_uv": uv_np,
+            "boundary_curve_arclength": arclength_np,
+            "boundary_curve_offsets": np.asarray(offsets, dtype=np.int64),
+            "boundary_curve_loop_id": np.asarray(loop_ids, dtype=np.int64),
+            "boundary_curve_piece_id": np.asarray(piece_ids, dtype=np.int64),
+            "boundary_curve_loop_kind": np.asarray(loop_kind_ids, dtype=np.int64),
+            "boundary_curve_loop_area": np.asarray(loop_areas, dtype=np.float64),
+            "boundary_curve_length": np.asarray(lengths, dtype=np.float64),
+            "boundary_curve_is_closed": np.asarray(closed_flags, dtype=bool),
+            "boundary_curve_num_pieces": np.asarray(len(pieces), dtype=np.int64),
+        }
+        if not as_torch:
+            return data_np
+
+        data_t = {
+            "boundary_curve_uv": torch.as_tensor(data_np["boundary_curve_uv"], dtype=torch.float32, device=self.device),
+            "boundary_curve_arclength": torch.as_tensor(data_np["boundary_curve_arclength"], dtype=torch.float32, device=self.device),
+            "boundary_curve_offsets": torch.as_tensor(data_np["boundary_curve_offsets"], dtype=torch.long, device=self.device),
+            "boundary_curve_loop_id": torch.as_tensor(data_np["boundary_curve_loop_id"], dtype=torch.long, device=self.device),
+            "boundary_curve_piece_id": torch.as_tensor(data_np["boundary_curve_piece_id"], dtype=torch.long, device=self.device),
+            "boundary_curve_loop_kind": torch.as_tensor(data_np["boundary_curve_loop_kind"], dtype=torch.long, device=self.device),
+            "boundary_curve_loop_area": torch.as_tensor(data_np["boundary_curve_loop_area"], dtype=torch.float32, device=self.device),
+            "boundary_curve_length": torch.as_tensor(data_np["boundary_curve_length"], dtype=torch.float32, device=self.device),
+            "boundary_curve_is_closed": torch.as_tensor(data_np["boundary_curve_is_closed"], dtype=torch.bool, device=self.device),
+            "boundary_curve_num_pieces": torch.as_tensor(data_np["boundary_curve_num_pieces"], dtype=torch.long, device=self.device),
+        }
+        self._boundary_curve_tensors_cache = data_t
+        return data_t
+
+    def boundary_parameter(self, uv_norm):
+        """Return nearest trim-loop id and cyclic arclength for UV boundary points.
+
+        This is a topology/debugging operation: loop assignment is intentionally
+        detached while the graph's node coordinates remain differentiable.
+        """
+        self._require_active_face()
+        device = uv_norm.device if isinstance(uv_norm, torch.Tensor) else self.device
+        dtype = uv_norm.dtype if isinstance(uv_norm, torch.Tensor) else torch.float32
+        points = (
+            uv_norm.detach().cpu().numpy()
+            if isinstance(uv_norm, torch.Tensor)
+            else np.asarray(uv_norm, dtype=np.float64)
+        )
+        original_shape = points.shape[:-1]
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        loops = self._boundary_parameter_loops
+        if loops is None:
+            loops = self._build_boundary_parameter_loops()
+
+        loop_ids = np.full((points.shape[0],), -1, dtype=np.int64)
+        parameters = np.zeros((points.shape[0],), dtype=np.float64)
+        best_distance2 = np.full((points.shape[0],), np.inf, dtype=np.float64)
+
+        for loop_id, loop in enumerate(loops):
+            if np.linalg.norm(loop[0] - loop[-1]) > 1e-10:
+                loop = np.concatenate((loop, loop[:1]), axis=0)
+            starts = loop[:-1]
+            deltas = loop[1:] - starts
+            lengths = np.linalg.norm(deltas, axis=1)
+            valid = lengths > 1e-12
+            starts = starts[valid]
+            deltas = deltas[valid]
+            lengths = lengths[valid]
+            if lengths.size == 0:
+                continue
+            cumulative = np.concatenate(([0.0], np.cumsum(lengths[:-1])))
+
+            rel = points[:, None, :] - starts[None, :, :]
+            fraction = np.sum(rel * deltas[None, :, :], axis=-1) / (
+                lengths[None, :] ** 2
+            )
+            fraction = np.clip(fraction, 0.0, 1.0)
+            projected = starts[None, :, :] + fraction[..., None] * deltas[None, :, :]
+            distance2 = np.sum((points[:, None, :] - projected) ** 2, axis=-1)
+            segment_id = np.argmin(distance2, axis=1)
+            row = np.arange(points.shape[0])
+            nearest_distance2 = distance2[row, segment_id]
+            better = nearest_distance2 < best_distance2
+            loop_ids[better] = loop_id
+            parameters[better] = (
+                cumulative[segment_id[better]]
+                + fraction[row[better], segment_id[better]] * lengths[segment_id[better]]
+            )
+            best_distance2[better] = nearest_distance2[better]
+
+        if np.any(loop_ids < 0):
+            raise RuntimeError("Could not assign all UV points to a CAD trim loop.")
+        return {
+            "loop_id": torch.as_tensor(loop_ids.reshape(original_shape), dtype=torch.long, device=device),
+            "parameter": torch.as_tensor(parameters.reshape(original_shape), dtype=dtype, device=device),
+        }
+
+    def uv_norm_inside_mask(self, uv_norm, tol: float | None = None):
+        """
+        Debug/final-filter hard trim mask. Optimization should prefer the SDF.
+        """
+        face = self._require_active_face()
+        tol = self.seed_domain_trim_tol if tol is None else float(tol)
+        device = uv_norm.device if isinstance(uv_norm, torch.Tensor) else self.device
+        uv_norm_np = (
+            uv_norm.detach().cpu().numpy()
+            if isinstance(uv_norm, torch.Tensor)
+            else np.asarray(uv_norm, dtype=float)
+        )
+        if uv_norm_np.shape[-1] != 2:
+            raise ValueError(f"uv_norm must end with dimension 2, got {uv_norm_np.shape}")
+
+        uv_raw = self.uv_norm_to_raw_from_bounds(
+            uv_norm_np,
+            u_raw_bounds=self._active_u_raw_bounds,
+            v_raw_bounds=self._active_v_raw_bounds,
+        )
+        inside = self.classify_uv_points_on_face(face, uv_raw, tol=tol)
+        return torch.tensor(
+            inside.reshape(-1).astype(np.float32),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    def sample_trim_sdf(self, uv_norm):
+        """Differentiably sample the active trim SDF grid at normalized UVs."""
+        self._require_active_face()
+        if self._seed_domain_sdf_grid is None:
+            raise RuntimeError("Call generate_from_file(shape_path) before sampling the trim SDF.")
+
+        device = uv_norm.device if isinstance(uv_norm, torch.Tensor) else self.device
+        uv_norm = torch.as_tensor(uv_norm, dtype=torch.float32, device=device)
+
+        if uv_norm.shape[-1] != 2:
+            raise ValueError(f"uv_norm must end with dimension 2, got {uv_norm.shape}")
+
+        original_shape = uv_norm.shape[:-1]
+        uv_flat = uv_norm.reshape(-1, 2)
+        grid = torch.empty((1, uv_flat.shape[0], 1, 2), dtype=uv_flat.dtype, device=uv_flat.device)
+        grid[0, :, 0, 0] = 2.0 * uv_flat[:, 0] - 1.0
+        grid[0, :, 0, 1] = 2.0 * uv_flat[:, 1] - 1.0
+
+        sdf_image = self._seed_domain_sdf_grid.to(device=device, dtype=uv_norm.dtype)
+        sdf_image = sdf_image.unsqueeze(0).unsqueeze(0)
+        sampled = F.grid_sample(
+            sdf_image,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        sdf = sampled.reshape(-1).reshape(original_shape)
+
+        uv_min = uv_norm.amin(dim=-1)
+        uv_max = uv_norm.amax(dim=-1)
+        outside_box = (uv_min < 0.0) | (uv_max > 1.0)
+
+        return torch.where(
+            outside_box,
+            -torch.ones_like(sdf),
+            sdf,
+        )
+
+    def smooth_inside_activity(self, uv_norm, tau: float = 0.01):
+        sdf = self.sample_trim_sdf(uv_norm)
+        return torch.sigmoid(sdf / float(tau))
+
+    # =========================================================================
+    # 4) Continuous surface evaluation
+    # =========================================================================
+
+    def eval_uv_norm(
+        self,
+        uv_norm,
+        metric_tol: float | None = None,
+        trim_tol: float | None = None,
+        return_inside_mask: bool = True,
+    ):
+        """
+        Evaluate the active CAD face at normalized UV query points.
+
+        Returns xyz, raw UV, first derivatives, first fundamental form terms,
+        area density J, and optionally a hard inside mask.
+        """
+        self._require_active_face()
+        metric_tol = self.metric_tol if metric_tol is None else float(metric_tol)
+        trim_tol = self.seed_domain_trim_tol if trim_tol is None else float(trim_tol)
+
+        input_was_tensor = isinstance(uv_norm, torch.Tensor)
+        device = uv_norm.device if input_was_tensor else self.device
+        uv_norm_np = uv_norm.detach().cpu().numpy() if input_was_tensor else np.asarray(uv_norm, dtype=float)
+        if uv_norm_np.shape[-1] != 2:
+            raise ValueError(f"uv_norm must end with dimension 2, got {uv_norm_np.shape}")
+
+        query_shape = uv_norm_np.shape[:-1]
+        uv_norm_flat = uv_norm_np.reshape(-1, 2)
+        uv_raw = self.uv_norm_to_raw_from_bounds(
+            uv_norm_flat,
+            u_raw_bounds=self._active_u_raw_bounds,
+            v_raw_bounds=self._active_v_raw_bounds,
+        )
+
+        xyz = np.empty((uv_raw.shape[0], 3), dtype=np.float32)
+        Xu = np.empty((uv_raw.shape[0], 3), dtype=np.float32)
+        Xv = np.empty((uv_raw.shape[0], 3), dtype=np.float32)
+
+        for i, (u, v) in enumerate(uv_raw):
+            p = self._active_surface.Value(float(u), float(v))
+            props = GeomLProp_SLProps(self._active_surface, float(u), float(v), 1, metric_tol)
+            du = props.D1U()
+            dv = props.D1V()
+            xyz[i] = [p.X(), p.Y(), p.Z()]
+            Xu[i] = [du.X(), du.Y(), du.Z()]
+            Xv[i] = [dv.X(), dv.Y(), dv.Z()]
+
+        out_shape_3 = (*query_shape, 3)
+        out_shape_2 = (*query_shape, 2)
+        xyz_t = torch.tensor(xyz.reshape(out_shape_3), dtype=torch.float32, device=device)
+        Xu_t = torch.tensor(Xu.reshape(out_shape_3), dtype=torch.float32, device=device)
+        Xv_t = torch.tensor(Xv.reshape(out_shape_3), dtype=torch.float32, device=device)
+        uv_norm_t = torch.tensor(uv_norm_np.reshape(out_shape_2), dtype=torch.float32, device=device)
+        uv_raw_t = torch.tensor(uv_raw.reshape(out_shape_2), dtype=torch.float32, device=device)
+
+        E = (Xu_t * Xu_t).sum(dim=-1)
+        Fm = (Xu_t * Xv_t).sum(dim=-1)
+        G = (Xv_t * Xv_t).sum(dim=-1)
+        J = torch.linalg.norm(torch.cross(Xu_t, Xv_t, dim=-1), dim=-1)
+
+        out = {
+            "uv_norm": uv_norm_t,
+            "uv_raw": uv_raw_t,
+            "xyz": xyz_t,
+            "Xu": Xu_t,
+            "Xv": Xv_t,
+            "E": E,
+            "F": Fm,
+            "G": G,
+            "J": J,
+        }
+        if return_inside_mask:
+            out["inside_mask"] = self.uv_norm_inside_mask(uv_norm_t, tol=trim_tol).reshape(query_shape)
+        return out
+
+    def eval_uv_norm_batch(self, uv_norm, *args, **kwargs):
+        return self.eval_uv_norm(uv_norm, *args, **kwargs)
+
+    def eval_uv_norm_batch_torch(
+        self,
+        uv_norm: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Differentiably map normalized UV points to XYZ on the active face.
+
+        The CAD surface is fixed and its topology is outside autograd. XYZ
+        gradients propagate to UV through OpenCascade's exact first surface
+        derivatives. This supports first-order gradient-based optimization;
+        higher-order UV derivatives are not provided by this bridge.
+        """
+        if not isinstance(uv_norm, torch.Tensor):
+            raise TypeError("uv_norm must be a torch.Tensor.")
+        original_shape = uv_norm.shape[:-1]
+        flat_uv = uv_norm.reshape(-1, 2)
+        xyz = _OCCSurfaceEvaluation.apply(flat_uv, self)
+        return {
+            "uv_norm": uv_norm,
+            "xyz": xyz.reshape(*original_shape, 3),
+        }
+
+    def estimate_face_target_size(self, face, n_u=None, n_v=None):
+        """Estimate a representative physical mesh spacing from CAD UV samples."""
+        n_u = self.mesh_n_u if n_u is None else int(n_u)
+        n_v = self.mesh_n_v if n_v is None else int(n_v)
+        if n_u < 2 or n_v < 2:
+            raise ValueError(f"n_u and n_v must be at least 2, got {n_u}, {n_v}")
+
+        def bbox_fallback():
+            box = Bnd_Box()
+            brepbndlib.Add(face, box)
+            xmin, ymin, zmin, xmax, ymax, zmax = map(float, box.Get())
+            diagonal = float(np.linalg.norm([xmax - xmin, ymax - ymin, zmax - zmin]))
+            return diagonal / float(max(n_u, n_v, 1))
+
+        try:
+            umin, umax, vmin, vmax = map(float, breptools.UVBounds(face))
+            surface = BRep_Tool.Surface(face)
+            if (
+                not np.isfinite([umin, umax, vmin, vmax]).all()
+                or abs(umax - umin) < 1e-30
+                or abs(vmax - vmin) < 1e-30
+            ):
+                return bbox_fallback()
+
+            u_values = np.linspace(umin, umax, n_u, dtype=np.float64)
+            v_values = np.linspace(vmin, vmax, n_v, dtype=np.float64)
+            points = np.empty((n_v, n_u, 3), dtype=np.float64)
+            for j, v in enumerate(v_values):
+                for i, u in enumerate(u_values):
+                    point = surface.Value(float(u), float(v))
+                    points[j, i] = [point.X(), point.Y(), point.Z()]
+
+            u_lengths = np.linalg.norm(np.diff(points, axis=1), axis=-1).reshape(-1)
+            v_lengths = np.linalg.norm(np.diff(points, axis=0), axis=-1).reshape(-1)
+            lengths = np.concatenate((u_lengths, v_lengths))
+            lengths = lengths[np.isfinite(lengths) & (lengths > 0.0)]
+            if lengths.size == 0:
+                return bbox_fallback()
+            return float(np.mean(lengths))
+        except Exception:
+            return bbox_fallback()
+
+    def build_face_mesh_tensors(
+        self,
+        res: int = 96,
+        mesh_size: float | None = None,
+        force_remesh: bool = False,
+    ) -> dict:
+        """Create and cache one Gmsh surface mesh for ``ThickenShell``.
+
+        The first call meshes the active STEP/IGES face. Subsequent calls with
+        the same mesh settings return the exact cached tensor objects,
+        so an optimization loop can reuse them without invoking Gmsh again.
+        Pass ``mesh_size`` to control the target element size directly in CAD
+        units. ``res`` is retained for call-site compatibility.
+        """
+        self._require_active_face()
+        if gmsh is None:
+            raise ImportError(
+                "Gmsh is required for build_face_mesh_tensors(); install the Python "
+                "package 'gmsh' in the notebook environment."
+            )
+        if self._active_shape_path is None:
+            raise RuntimeError("The active CAD file path is unavailable; reload it first.")
+
+        res = int(res)
+        if res < 3:
+            raise ValueError(f"res must be at least 3, got {res}")
+
+        box = Bnd_Box()
+        brepbndlib.Add(self._active_face, box)
+        xmin, ymin, zmin, xmax, ymax, zmax = map(float, box.Get())
+        target_size = (
+            float(mesh_size)
+            if mesh_size is not None
+            else self.mesh_size_scale * self.estimate_face_target_size(
+                self._active_face,
+                n_u=self.mesh_n_u,
+                n_v=self.mesh_n_v,
+            )
+        )
+        if target_size <= 0.0:
+            raise ValueError(f"mesh target size must be positive, got {target_size}")
+
+        cache_key = (
+            os.path.abspath(self._active_shape_path),
+            float(target_size),
+            int(self.mesh_algorithm),
+        )
+        if (
+            not force_remesh
+            and self._shell_tensors_cache is not None
+            and self._shell_mesh_cache_key == cache_key
+        ):
+            return self._shell_tensors_cache
+
+        owns_gmsh = not bool(gmsh.isInitialized())
+        if owns_gmsh:
+            gmsh.initialize()
+        try:
+            gmsh.clear()
+            gmsh.model.add("cad_tensor_surface")
+            gmsh.model.occ.importShapes(os.fspath(self._active_shape_path))
+            gmsh.model.occ.synchronize()
+
+            surfaces = gmsh.model.getEntities(2)
+            if len(surfaces) != 1:
+                raise ValueError(
+                    f"Expected Gmsh to import one CAD face, got {len(surfaces)}."
+                )
+            surface_tag = int(surfaces[0][1])
+            gmsh.option.setNumber("Mesh.Algorithm", int(self.mesh_algorithm))
+            gmsh.option.setNumber("Mesh.ElementOrder", 1)
+            gmsh.option.setNumber("Mesh.MeshSizeMin", target_size)
+            gmsh.option.setNumber("Mesh.MeshSizeMax", target_size)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+            gmsh.model.mesh.generate(2)
+
+            node_tags, _coords, uv_raw_flat = gmsh.model.mesh.getNodes(
+                2,
+                surface_tag,
+                includeBoundary=True,
+                returnParametricCoord=True,
+            )
+            node_tags = np.asarray(node_tags, dtype=np.int64)
+            uv_raw_np = np.asarray(uv_raw_flat, dtype=float).reshape(-1, 2)
+            if node_tags.size == 0 or uv_raw_np.shape[0] != node_tags.size:
+                raise RuntimeError("Gmsh did not return surface UV coordinates.")
+
+            # A node can be returned more than once when boundary entities are
+            # included. Keep one UV record per Gmsh node tag.
+            unique_tags, first = np.unique(node_tags, return_index=True)
+            order = np.argsort(first)
+            node_tags = unique_tags[order]
+            uv_raw_np = uv_raw_np[first[order]]
+            tag_to_index = {int(tag): i for i, tag in enumerate(node_tags)}
+
+            triangles = []
+            element_types, _element_tags, element_nodes = gmsh.model.mesh.getElements(
+                2, surface_tag
+            )
+            for element_type, connectivity in zip(element_types, element_nodes):
+                _name, dim, _order, num_nodes, _local, num_primary = (
+                    gmsh.model.mesh.getElementProperties(int(element_type))
+                )
+                if int(dim) != 2:
+                    continue
+                conn = np.asarray(connectivity, dtype=np.int64).reshape(-1, int(num_nodes))
+                primary = conn[:, :int(num_primary)]
+                if primary.shape[1] == 3:
+                    triangles.extend(primary.tolist())
+                elif primary.shape[1] == 4:
+                    triangles.extend(primary[:, [0, 1, 2]].tolist())
+                    triangles.extend(primary[:, [0, 2, 3]].tolist())
+
+            if not triangles:
+                raise RuntimeError("Gmsh generated no surface triangles.")
+            faces_np = np.asarray(
+                [[tag_to_index[int(tag)] for tag in tri] for tri in triangles],
+                dtype=np.int64,
+            )
+
+            boundary_tags = []
+            for dim, curve_tag in gmsh.model.getBoundary(
+                [(2, surface_tag)], oriented=False, recursive=False
+            ):
+                tags, _xyz, _param = gmsh.model.mesh.getNodes(
+                    int(dim), int(curve_tag), includeBoundary=True
+                )
+                boundary_tags.extend(np.asarray(tags, dtype=np.int64).tolist())
+            boundary_idx = np.asarray(
+                sorted({tag_to_index[int(tag)] for tag in boundary_tags if int(tag) in tag_to_index}),
+                dtype=np.int64,
+            )
+        finally:
+            gmsh.clear()
+            if owns_gmsh:
+                gmsh.finalize()
+
+        uv_norm_np = self.uv_raw_to_norm_from_bounds(
+            uv_raw_np,
+            u_raw_bounds=self._active_u_raw_bounds,
+            v_raw_bounds=self._active_v_raw_bounds,
+        )
+        evaluated = self.eval_uv_norm(uv_norm_np, return_inside_mask=False)
+        points = evaluated["xyz"]
+        xu = evaluated["Xu"]
+        xv = evaluated["Xv"]
+        uv = evaluated["uv_norm"]
+
+        if faces_np.shape[0] > 0:
+            points_np = points.detach().cpu().numpy()
+            p0 = points_np[faces_np[:, 0]]
+            p1 = points_np[faces_np[:, 1]]
+            p2 = points_np[faces_np[:, 2]]
+            face_areas_np = 0.5 * np.linalg.norm(
+                np.cross(p1 - p0, p2 - p0), axis=1
+            )
+
+        else:
+            face_areas_np = np.empty((0,), dtype=np.float32)
+
+        bbox = {
+            "xmin": xmin, "xmax": xmax,
+            "ymin": ymin, "ymax": ymax,
+            "zmin": zmin, "zmax": zmax,
+        }
+
+        faces_t = torch.as_tensor(faces_np, dtype=torch.long, device=self.device)
+        if faces_np.shape[0] > 0:
+            pv_faces_np = np.column_stack(
+                (np.full(faces_np.shape[0], 3, dtype=np.int64), faces_np)
+            ).reshape(-1)
+        else:
+            pv_faces_np = np.empty((0,), dtype=np.int64)
+
+        shell_tensors = {
+            "uv": uv,
+            "points_xyz": points,
+            "face_areas": torch.as_tensor(face_areas_np, dtype=points.dtype, device=self.device),
+            "Xu": xu,
+            "Xv": xv,
+            "faces_ijk": faces_t,
+            "pv_faces": torch.as_tensor(pv_faces_np, dtype=torch.long, device=self.device),
+            "face_id": torch.zeros(points.shape[0], dtype=torch.long, device=self.device),
+            "boundary_idx_ring1": torch.as_tensor(boundary_idx, dtype=torch.long, device=self.device),
+            "min_vol_frac": torch.tensor(0.0, dtype=points.dtype, device=self.device),
+            "BBX": bbox,
+        }
+        shell_tensors.update(self.boundary_curve_tensors(as_torch=True))
+        self._shell_tensors_cache = shell_tensors
+        self._shell_mesh_cache_key = cache_key
+        return shell_tensors
+
+    def sample_shell_tensors(self, *args, **kwargs):
+        return self.build_face_mesh_tensors(*args, **kwargs)
+
+    # =========================================================================
+    # 5) Trainer helper contract
+    # =========================================================================
+
+    @staticmethod
+    def vertex_area_lumped(
+        num_vertices: int,
+        faces_ijk: torch.Tensor,
+        face_areas: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return barycentric lumped area per mesh vertex."""
+        device = faces_ijk.device
+        dtype = face_areas.dtype if face_areas.is_floating_point() else torch.float32
+        area = torch.zeros((int(num_vertices),), dtype=dtype, device=device)
+        if faces_ijk.numel() == 0:
+            return area
+        tri_area = face_areas.to(device=device, dtype=dtype).reshape(-1) / 3.0
+        contrib = tri_area[:, None].expand(-1, 3).reshape(-1)
+        return area.scatter_add(0, faces_ijk.reshape(-1).to(device=device), contrib)
+
+    @staticmethod
+    def fps_3d(
+        points_xyz: torch.Tensor,
+        n_samples: int,
+        exclude_idx=None,
+        seed: int | None = None,
+    ) -> torch.Tensor:
+        """Farthest-point sample indices from a 3D point cloud."""
+        points = points_xyz.detach()
+        device = points.device
+        n_points = int(points.shape[0])
+        n_samples = min(int(n_samples), n_points)
+        if n_samples <= 0:
+            return torch.empty((0,), dtype=torch.long, device=device)
+
+        candidate_mask = torch.ones((n_points,), dtype=torch.bool, device=device)
+        if exclude_idx is not None:
+            exclude_idx = torch.as_tensor(exclude_idx, dtype=torch.long, device=device)
+            exclude_idx = exclude_idx[(exclude_idx >= 0) & (exclude_idx < n_points)]
+            if exclude_idx.numel() > 0:
+                candidate_mask[exclude_idx] = False
+        candidates = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+        if candidates.numel() == 0:
+            candidates = torch.arange(n_points, dtype=torch.long, device=device)
+        n_samples = min(n_samples, int(candidates.numel()))
+
+        if seed is not None:
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(seed))
+            first_local = int(torch.randint(candidates.numel(), (1,), generator=gen).item())
+        else:
+            centroid = points[candidates].mean(dim=0, keepdim=True)
+            first_local = int(torch.argmax(torch.linalg.norm(points[candidates] - centroid, dim=1)).item())
+
+        selected = [candidates[first_local]]
+        min_dist = torch.cdist(points[candidates], points[selected[0]].reshape(1, 3)).reshape(-1)
+        selected_mask = torch.zeros((candidates.numel(),), dtype=torch.bool, device=device)
+        selected_mask[first_local] = True
+
+        for _ in range(1, n_samples):
+            scores = torch.where(selected_mask, torch.full_like(min_dist, -1.0), min_dist)
+            next_local = int(torch.argmax(scores).item())
+            selected_mask[next_local] = True
+            selected.append(candidates[next_local])
+            dist_new = torch.cdist(points[candidates], points[candidates[next_local]].reshape(1, 3)).reshape(-1)
+            min_dist = torch.minimum(min_dist, dist_new)
+
+        return torch.stack(selected).to(dtype=torch.long)
+
+    @staticmethod
+    def seeds_uv_to_xyz_nearest(
+        seeds_uv: torch.Tensor,
+        uv: torch.Tensor,
+        points_xyz: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map seed UVs to nearest mesh sample XYZ for visualization."""
+        seeds_uv = seeds_uv.to(device=uv.device, dtype=uv.dtype)
+        nn = torch.cdist(seeds_uv, uv).argmin(dim=1)
+        return points_xyz.to(device=uv.device)[nn]
+
+    def eval_face_uv_from_face_tensor(
+        self,
+        shape_or_path=None,
+        face_tensor=None,
+        uv_norm=None,
+        metric_tol: float | None = None,
+        trim_tol: float | None = None,
+        as_torch: bool = True,
+    ) -> dict:
+        """Evaluate normalized UV points on the active face.
+
+        ``face_tensor`` and ``shape_or_path`` are accepted for trainer
+        compatibility; this generator already owns the active CAD face.
+        """
+        if uv_norm is None:
+            if face_tensor is None:
+                raise ValueError("uv_norm or face_tensor must be provided.")
+            uv_norm = face_tensor["uv"]
+        out = self.eval_uv_norm(
+            uv_norm,
+            metric_tol=metric_tol,
+            trim_tol=trim_tol,
+            return_inside_mask=True,
+        )
+        out["valid_mask"] = out["inside_mask"].reshape(-1).to(dtype=torch.bool)
+        out["points_xyz"] = out["xyz"]
+        if as_torch:
+            return out
+        return {
+            key: value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else value
+            for key, value in out.items()
+        }
+
+    # =========================================================================
+    # 6) Decoder contract
+    # =========================================================================
+
+    def generate_from_file(self, shape_path: str | None = None):
+        """
+        Load a single-face CAD file and return UV metadata plus mesh tensors.
+
+        No mesh vertices, mesh faces, nearest-neighbor projections, or
+        selected-face logic appear in this decoder path.
+        """
+        if shape_path is None:
+            shape_path = self.shape_path
+        if shape_path is None:
+            raise ValueError(
+                "shape_path must be provided either to the constructor or generate_from_file()."
+            )
+        self.shape_path = os.fspath(shape_path)
+
+        shape = self.load_shape(shape_path)
+        face = self.get_single_face(shape)
+        (umin, umax, vmin, vmax), surf = self.face_uv_bounds_and_surface(face)
+        surface_u_periodic, surface_v_periodic, u_period, v_period = self.face_uv_periodicity(face)
+
+        u_span = abs(float(umax) - float(umin))
+        v_span = abs(float(vmax) - float(vmin))
+
+        self._u_periodic = (
+        bool(surface_u_periodic)
+        and u_period is not None
+        and abs(u_span - float(u_period)) <= max(1e-6, 1e-4 * abs(float(u_period)))
+        )
+
+        self._v_periodic = (
+        bool(surface_v_periodic)
+        and v_period is not None
+        and abs(v_span - float(v_period)) <= max(1e-6, 1e-4 * abs(float(v_period)))
+        )
+
+        self._u_period = None if not self._u_periodic else float(u_period)
+        self._v_period = None if not self._v_periodic else float(v_period)
+
+        mask_grid_np = self.build_seed_domain_mask_grid(
+            face=face,
+            u_raw_bounds=(umin, umax),
+            v_raw_bounds=(vmin, vmax),
+            res=self.seed_domain_mask_res,
+            trim_tol=self.seed_domain_trim_tol,
+        )
+        sdf_grid_np = self.build_seed_domain_sdf_grid(mask_grid_np)
+
+        self._active_shape = shape
+        self._active_shape_path = os.path.abspath(os.fspath(shape_path))
+        self._active_face = face
+        self._active_surface = surf
+        self._active_u_raw_bounds = (float(umin), float(umax))
+        self._active_v_raw_bounds = (float(vmin), float(vmax))
+        self._seed_domain_mask_grid = torch.tensor(
+            mask_grid_np,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._seed_domain_sdf_grid = torch.tensor(
+            sdf_grid_np,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._boundary_parameter_loops = None
+        self._boundary_curve_pieces = None
+        self._boundary_curve_tensors_cache = None
+        self._shell_tensors_cache = None
+        self._shell_mesh_cache_key = None
+        boundary_tensors = self.boundary_curve_tensors(as_torch=True)
+
+        domain = {
+            "u_raw_bounds": self._active_u_raw_bounds,
+            "v_raw_bounds": self._active_v_raw_bounds,
+            "seed_domain_mask_grid": self._seed_domain_mask_grid,
+            "seed_domain_sdf_grid": self._seed_domain_sdf_grid,
+            "seed_domain_mask_kind": "cad_trim_grid",
+            "device": self.device,
+            "u_periodic": self._u_periodic,
+            "v_periodic": self._v_periodic,
+            "u_period": self._u_period,
+            "v_period": self._v_period,
+        }
+        domain.update(boundary_tensors)
+        tensors = self.build_face_mesh_tensors()
+        return domain, tensors
+
+    def print_face_info(self):
+        self._require_active_face()
+
+        box = Bnd_Box()
+        brepbndlib.Add(self._active_face, box)
+
+        xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+
+        dx = xmax - xmin
+        dy = ymax - ymin
+        dz = zmax - zmin
+
+        print("\n=== Active Face Info ===")
+
+        print(
+            f"XYZ bounds:\n"
+            f"  X: [{xmin:.6f}, {xmax:.6f}]  span={dx:.6f}\n"
+            f"  Y: [{ymin:.6f}, {ymax:.6f}]  span={dy:.6f}\n"
+            f"  Z: [{zmin:.6f}, {zmax:.6f}]  span={dz:.6f}"
+        )
+
+        print(
+            f"\nUV bounds:\n"
+            f"  U: [{self._active_u_raw_bounds[0]:.6f}, "
+            f"{self._active_u_raw_bounds[1]:.6f}]"
+        )
+
+        print(
+            f"  V: [{self._active_v_raw_bounds[0]:.6f}, "
+            f"{self._active_v_raw_bounds[1]:.6f}]"
+        )
+
+        print(
+            f"\nPeriodic:\n"
+            f"  U periodic: {self._u_periodic}\n"
+            f"  V periodic: {self._v_periodic}"
+        )
+
+        print("========================\n")
+        return dx,dy,dz

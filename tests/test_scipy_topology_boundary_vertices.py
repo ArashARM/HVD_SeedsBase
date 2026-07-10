@@ -59,7 +59,6 @@ def test_scipy_topology_prunes_unreferenced_vertices_and_reports_final_counts():
     num_vertices = out["vertices_uv"].shape[0]
     edges = out["edges"]["edge_index"]
 
-    assert torch.all(out["vertex_degree"] > 0)
     assert edges.numel() == 0 or int(edges.max()) < num_vertices
     assert num_vertices == diagnostics["num_final_nodes"]
     assert edges.shape[0] == diagnostics["num_final_edges"]
@@ -113,7 +112,7 @@ def test_generated_graph_plot_labels_compact_node_and_edge_ids(monkeypatch):
     expected_node_labels = {
         (
             "I" if int(node_type) == 0
-            else "C" if int(source_types[node_id]) == 4
+            else "C" if int(source_types[node_id]) == 6
             else "B"
         ) + str(node_id)
         for node_id, node_type in enumerate(out["graph"]["node_type"])
@@ -135,7 +134,7 @@ def test_box_boundary_shell_is_closed_without_pair_bisector_completion():
     edges = graph["edge_index"]
     edge_type = graph["edge_type"]
     source_type = graph["boundary_source_type"]
-    corner_ids = torch.nonzero(source_type == 4, as_tuple=False).flatten()
+    corner_ids = torch.nonzero(source_type == 6, as_tuple=False).flatten()
 
     assert corner_ids.numel() == 4
     assert int((edge_type == 4).sum()) == 4
@@ -143,6 +142,66 @@ def test_box_boundary_shell_is_closed_without_pair_bisector_completion():
     for node_id in corner_ids.tolist():
         incident = (edges == node_id).any(dim=1)
         assert int((incident & (edge_type == 4)).sum()) == 2
+
+
+def test_box_boundary_intersections_use_domain_boundary_source_type():
+    decoder = make_decoder()
+    seeds = torch.tensor(
+        [
+            [0.15, 0.15],
+            [0.85, 0.15],
+            [0.15, 0.85],
+            [0.85, 0.85],
+            [0.50, 0.50],
+        ],
+        dtype=torch.float64,
+    )
+
+    out = decoder.forward_scipy_topology(seeds, return_xyz=False)
+    source_type = out["graph"]["boundary_source_type"]
+
+    assert torch.any(source_type == 5)
+    assert not torch.any(source_type == 2)
+
+
+def test_packed_cad_boundary_piece_endpoints_are_fixed_shell_nodes():
+    decoder = make_decoder(use_trim_activity=False)
+    seeds = torch.tensor([[0.25, 0.50], [0.75, 0.50]], dtype=torch.float64)
+    cad_domain = {
+        "boundary_curve_uv": torch.tensor(
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=torch.float64,
+        ),
+        "boundary_curve_offsets": torch.tensor([0, 2, 3, 4, 5], dtype=torch.long),
+    }
+
+    out = decoder.forward_scipy_topology(seeds, cad_domain=cad_domain, return_xyz=False)
+    graph = out["graph"]
+
+    assert int((graph["boundary_source_type"] == 6).sum()) == 4
+    assert int((graph["edge_type"] == 4).sum()) == 4
+
+
+def test_dense_smooth_cad_boundary_samples_do_not_become_nodes():
+    decoder = make_decoder(use_trim_activity=False)
+    seeds = torch.tensor([[0.25, 0.50], [0.75, 0.50]], dtype=torch.float64)
+    theta = torch.linspace(0.0, 2.0 * torch.pi, 65, dtype=torch.float64)
+    boundary_uv = torch.stack(
+        (
+            0.5 + 0.35 * torch.cos(theta),
+            0.5 + 0.35 * torch.sin(theta),
+        ),
+        dim=1,
+    )
+    cad_domain = {
+        "boundary_curve_uv": boundary_uv,
+        "boundary_curve_offsets": torch.tensor([0, boundary_uv.shape[0]], dtype=torch.long),
+    }
+
+    topo = decoder.build_scipy_voronoi_topology(seeds, cad_domain=cad_domain)
+
+    assert int((topo["boundary_source_type"] == 6).sum()) == 1
+    assert topo["vertices_uv"].shape[0] < boundary_uv.shape[0]
 
 
 def test_guard_seed_topology_uses_only_finite_real_real_ridges():

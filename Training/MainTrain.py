@@ -1,5 +1,6 @@
 from dataclasses import asdict, dataclass
 import csv
+import hashlib
 import importlib
 import json
 import math
@@ -10,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 import cv2
+from sympy import python
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from Utils.TimelapseRecorder import TimelapseRecorder
@@ -27,6 +29,7 @@ except Exception:
     pass
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 
 try:
     from .Loss_Boundary import Loss_Boundary
@@ -95,6 +98,8 @@ class TrainingConfig:
     seed_repulsion_sigma: float = 0.08
     boundary_margin: float = 0.05
 
+    curve_length_worst_weight: float = 0.1,
+
     freeze_w: bool = False
     w_const: float = 0.25
     width_target_frac: float = 0.20
@@ -155,6 +160,16 @@ class TrainingConfig:
     curve_length_eps: float = 1e-8
     curve_length_tolerance: float = 0.15
     curve_length_outlier_weight: float = 1.0
+    curve_length_exclude_shell_edges: bool = True
+    curve_length_ratio_target: float = 1.25
+    curve_length_ratio_weight: float = 50.0
+    curve_length_range_weight: float = 10.0
+    curve_length_log_weight: float = 10.0
+    curve_length_max_log_weight: float = 50.0
+    curve_length_short_edge_weight: float = 50.0
+    curve_length_long_edge_weight: float = 10.0
+    curve_length_equal_edge_types: tuple[int, ...] | None = (0,)
+    curve_length_report_edge_types: tuple[int, ...] | None = (0,)
     lam_cell_edge_uniform: float = 1.0
     lam_cell_angle_uniform: float = 1.0
     lam_cell_radial_uniform: float = 0.5
@@ -176,6 +191,7 @@ class TrainingConfig:
     seed_anchor_momentum: float = 0.20
     seed_anchor_warmup_frac: float = 0.05
     use_rolling_seed_anchors: bool = True
+    disable_rolling_seed_anchors_for_curve_only: bool = True
     guard_seed_anchor_updates: bool = True
     anchor_guard_rep_max: float = 0.30
     anchor_guard_bnd_max: float = 0.80
@@ -1350,7 +1366,12 @@ class NN_Trainer:
         self.tensorboard_log_dir = None
         self._init_tensorboard()
 
-    def curve_3d_edge_lengths(self, decoder_out):
+    def curve_3d_edge_lengths(
+        self,
+        decoder_out,
+        include_shell_edges: bool | None = None,
+        edge_types: tuple[int, ...] | list[int] | None = None,
+    ):
         curves = decoder_out.get("edge_curves_xyz", None)
         if curves is None:
             for value in decoder_out.values():
@@ -1367,9 +1388,141 @@ class NN_Trainer:
 
         seg = curves[:, 1:, :] - curves[:, :-1, :]
         edge_len = torch.linalg.norm(seg, dim=-1).sum(dim=-1)
+        graph = decoder_out.get("graph", None)
+        edge_type = graph.get("edge_type", None) if isinstance(graph, dict) else None
+        if edge_type is not None:
+            edge_type = torch.as_tensor(edge_type, dtype=torch.long, device=edge_len.device).reshape(-1)
+            if edge_type.shape[0] == edge_len.shape[0]:
+                if edge_types is not None:
+                    keep = torch.zeros_like(edge_type, dtype=torch.bool)
+                    for value in tuple(edge_types):
+                        keep = keep | (edge_type == int(value))
+                    edge_len = edge_len[keep]
+                else:
+                    if include_shell_edges is None:
+                        include_shell_edges = not bool(getattr(self.cfg, "curve_length_exclude_shell_edges", True))
+                    if not include_shell_edges:
+                        edge_len = edge_len[edge_type != 4]
+        elif include_shell_edges is None:
+            include_shell_edges = not bool(getattr(self.cfg, "curve_length_exclude_shell_edges", True))
         return edge_len[torch.isfinite(edge_len)]
 
+    @staticmethod
+    def topology_identifier_from_graph(graph: dict | None) -> str:
+        if not isinstance(graph, dict):
+            return ""
+
+        digest = hashlib.sha1()
+        wrote_any = False
+        for key in ("edge_index", "edge_seed_pair", "edge_type"):
+            value = graph.get(key, None)
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                arr = value.detach().cpu().numpy()
+            else:
+                arr = np.asarray(value)
+            arr = np.ascontiguousarray(arr)
+            digest.update(key.encode("utf-8"))
+            digest.update(str(arr.shape).encode("utf-8"))
+            digest.update(str(arr.dtype).encode("utf-8"))
+            digest.update(arr.tobytes())
+            wrote_any = True
+        return digest.hexdigest()[:16] if wrote_any else ""
+
+    def solution_topology_metrics(
+        self,
+        decoder_out: dict,
+        curve_lengths: torch.Tensor | None = None,
+    ) -> dict[str, float | int | str]:
+        if curve_lengths is None:
+            curve_lengths = self.curve_3d_edge_lengths(
+                decoder_out,
+                edge_types=getattr(self.cfg, "curve_length_report_edge_types", (0,)),
+            )
+
+        graph = decoder_out.get("graph", None)
+        edge_index = graph.get("edge_index", None) if isinstance(graph, dict) else None
+        if isinstance(edge_index, torch.Tensor):
+            number_of_edges = int(edge_index.shape[0])
+        elif edge_index is not None:
+            number_of_edges = int(np.asarray(edge_index).shape[0])
+        else:
+            curves = decoder_out.get("edge_curves_xyz", decoder_out.get("edge_curves_uv", None))
+            number_of_edges = int(curves.shape[0]) if isinstance(curves, torch.Tensor) and curves.ndim >= 1 else 0
+
+        if curve_lengths is not None and curve_lengths.numel() > 0:
+            lengths = curve_lengths.detach()
+            minimum_length = float(lengths.min().item())
+            maximum_length = float(lengths.max().item())
+            mean_length = float(lengths.mean().item())
+            standard_deviation = float(lengths.std(unbiased=False).item())
+            coefficient_of_variation = (
+                standard_deviation / mean_length
+                if math.isfinite(mean_length) and abs(mean_length) > float(self.cfg.eps)
+                else float("nan")
+            )
+            maximum_minimum_ratio = maximum_length / max(minimum_length, float(self.cfg.eps))
+        else:
+            minimum_length = float("nan")
+            maximum_length = float("nan")
+            mean_length = float("nan")
+            standard_deviation = float("nan")
+            coefficient_of_variation = float("nan")
+            maximum_minimum_ratio = float("nan")
+
+        return {
+            "minimum_length": minimum_length,
+            "maximum_length": maximum_length,
+            "mean_length": mean_length,
+            "standard_deviation": standard_deviation,
+            "coefficient_of_variation": coefficient_of_variation,
+            "maximum_minimum_ratio": maximum_minimum_ratio,
+            "number_of_edges": number_of_edges,
+            "topology_identifier": self.topology_identifier_from_graph(graph),
+        }
+
+
     def curve_length_similarity_loss(self, decoder_out):
+        """
+        Encourage selected 3D edge curves to have equal lengths while
+        giving additional attention to the worst edge-length outlier.
+        """
+        cfg = self.cfg
+
+        edge_types = getattr(
+            cfg,
+            "curve_length_equal_edge_types",
+            (0,),
+        )
+
+        edge_lengths = self.curve_3d_edge_lengths(
+            decoder_out,
+            edge_types=edge_types,
+        )
+
+        if edge_lengths.numel() <= 1:
+            return edge_lengths.new_zeros(())
+
+        eps = float(getattr(cfg, "curve_length_eps", 1e-8))
+        mean_length = edge_lengths.mean().clamp_min(eps)
+
+        log_relative_lengths = torch.log(
+            edge_lengths.clamp_min(eps) / mean_length
+        )
+
+        mean_loss = log_relative_lengths.square().mean()
+        worst_loss = log_relative_lengths.abs().max().square()
+
+        worst_weight = float(
+            getattr(cfg, "curve_length_worst_weight", 0.1)
+        )
+
+        return mean_loss + worst_weight * worst_loss
+
+
+
+    def curve_length_similarity_loss_old(self, decoder_out):
         """
         Differentiable loss that encourages all generated 3D edge curves
         to have similar lengths.
@@ -1377,7 +1530,8 @@ class NN_Trainer:
         Uses decoder_out["edge_curves_xyz"] with shape [E, K, 3].
         """
         cfg = self.cfg
-        edge_len = self.curve_3d_edge_lengths(decoder_out)
+        equal_edge_types = getattr(cfg, "curve_length_equal_edge_types", (0,))
+        edge_len = self.curve_3d_edge_lengths(decoder_out, edge_types=equal_edge_types)
         if edge_len.numel() <= 1:
             return edge_len.new_zeros(())
 
@@ -1385,36 +1539,64 @@ class NN_Trainer:
         mean_len = edge_len.mean().clamp_min(eps)
         loss_type = str(getattr(cfg, "curve_length_loss_type", "cv")).lower()
 
+        def equality_shape_penalty() -> torch.Tensor:
+            min_len = edge_len.min().clamp_min(eps)
+            max_len = edge_len.max()
+            ratio_target = max(float(getattr(cfg, "curve_length_ratio_target", 1.25)), 1.0 + eps)
+            ratio_weight = max(float(getattr(cfg, "curve_length_ratio_weight", 50.0)), 0.0)
+            range_weight = max(float(getattr(cfg, "curve_length_range_weight", 10.0)), 0.0)
+            log_weight = max(float(getattr(cfg, "curve_length_log_weight", 10.0)), 0.0)
+            max_log_weight = max(float(getattr(cfg, "curve_length_max_log_weight", 50.0)), 0.0)
+            short_edge_weight = max(float(getattr(cfg, "curve_length_short_edge_weight", 50.0)), 0.0)
+            long_edge_weight = max(float(getattr(cfg, "curve_length_long_edge_weight", 10.0)), 0.0)
+            tol = max(float(getattr(cfg, "curve_length_tolerance", 0.15)), eps)
+            ratio = max_len / min_len
+            ratio_excess = torch.relu(torch.log(ratio / ratio_target))
+            rel_range = (max_len - min_len) / mean_len
+            log_to_mean = torch.log((edge_len / mean_len).clamp_min(eps))
+            lower = torch.exp(edge_len.new_tensor(-tol))
+            upper = torch.exp(edge_len.new_tensor(tol))
+            short_excess = torch.relu(torch.log((mean_len * lower / edge_len.clamp_min(eps)).clamp_min(eps)))
+            long_excess = torch.relu(torch.log((edge_len / (mean_len * upper)).clamp_min(eps)))
+            return (
+                log_weight * log_to_mean.pow(2).mean()
+                + max_log_weight * log_to_mean.abs().max().pow(2)
+                + ratio_weight * ratio_excess.pow(2)
+                + range_weight * rel_range.pow(2)
+                + short_edge_weight * short_excess.pow(2).max()
+                + long_edge_weight * long_excess.pow(2).max()
+            )
+
         if loss_type == "target" and getattr(cfg, "curve_length_target", None) is not None:
             target = torch.as_tensor(
                 float(cfg.curve_length_target),
                 dtype=edge_len.dtype,
                 device=edge_len.device,
             )
-            return ((edge_len - target) / target.clamp_min(eps)).pow(2).mean()
+            return ((edge_len - target) / target.clamp_min(eps)).pow(2).mean() + equality_shape_penalty()
 
         if loss_type == "var":
-            return ((edge_len - mean_len) / mean_len).pow(2).mean()
+            return ((edge_len - mean_len) / mean_len).pow(2).mean() + equality_shape_penalty()
         if loss_type == "pairwise":
             diff = edge_len[:, None] - edge_len[None, :]
             denom = mean_len.pow(2).clamp_min(eps)
-            return diff.pow(2).mean() / denom
+            return diff.pow(2).mean() / denom + equality_shape_penalty()
         
         if loss_type == "pairwise_smooth_l1":
             diff = edge_len[:, None] - edge_len[None, :]
-            return torch.sqrt(diff.pow(2) + eps).mean() / mean_len
+            return torch.sqrt(diff.pow(2) + eps).mean() / mean_len + equality_shape_penalty()
         
         if loss_type == "range_cv":
             cv = edge_len.var(unbiased=False) / mean_len.pow(2).clamp_min(eps)
             rel_range = (edge_len.max() - edge_len.min()) / mean_len
-            return cv + 5.0*rel_range.pow(2)
+            return cv + 5.0 * rel_range.pow(2) + equality_shape_penalty()
         
         if loss_type == "log_tolerance":
             ratio = edge_len / mean_len
             log_ratio = torch.log(ratio.clamp_min(eps))
             tol = float(getattr(cfg, "curve_length_tolerance", 0.15))
             excess = torch.relu(log_ratio.abs() - tol)
-            return excess.pow(2).mean()
+            return excess.pow(2).mean() + equality_shape_penalty()
 
         if loss_type == "log_tolerance_max":
             ratio = edge_len / mean_len
@@ -1422,9 +1604,9 @@ class NN_Trainer:
             tol = float(getattr(cfg, "curve_length_tolerance", 0.15))
             excess = torch.relu(log_ratio.abs() - tol)
             outlier_weight = float(getattr(cfg, "curve_length_outlier_weight", 1.0))
-            return excess.pow(2).mean() + outlier_weight * excess.max().pow(2)
+            return excess.pow(2).mean() + outlier_weight * excess.max().pow(2) + equality_shape_penalty()
 
-        return edge_len.var(unbiased=False) / mean_len.pow(2)
+        return edge_len.var(unbiased=False) / mean_len.pow(2) + equality_shape_penalty()
     
 
     
@@ -1467,12 +1649,6 @@ class NN_Trainer:
         valid_edge = finite_edges & valid_pairs.any(dim=1)
         if not bool(valid_edge.any().detach().cpu().item()):
             return curves.new_zeros(())
-
-        edge_alpha = graph.get("edge_alpha", None)
-        if torch.is_tensor(edge_alpha) and edge_alpha.shape == edge_len.shape:
-            edge_weight = edge_alpha.to(dtype=edge_len.dtype, device=edge_len.device).clamp_min(0.0)
-        else:
-            edge_weight = torch.ones_like(edge_len)
 
         eps = float(getattr(cfg, "cell_edge_uniform_eps", 1e-8))
         angle_eps = float(getattr(cfg, "cell_angle_uniform_eps", 1e-8))
@@ -1572,17 +1748,14 @@ class NN_Trainer:
             edge_ids = torch.nonzero(belongs, as_tuple=False).flatten()
 
             lengths = edge_len[belongs]
-            weights = edge_weight[belongs]
-            finite = torch.isfinite(lengths) & torch.isfinite(weights) & (weights > 0.0)
+            finite = torch.isfinite(lengths)
             if int(finite.sum().detach().cpu().item()) <= 1:
                 continue
 
             lengths = lengths[finite]
-            weights = weights[finite]
-            weight_sum = weights.sum().clamp_min(eps)
-            mean_len = (weights * lengths).sum() / weight_sum
+            mean_len = lengths.mean()
             mean_len = mean_len.clamp_min(eps)
-            var_len = (weights * (lengths - mean_len).pow(2)).sum() / weight_sum
+            var_len = (lengths - mean_len).pow(2).mean()
             cell_loss = var_len / mean_len.pow(2)
 
             cell_vertices = polygon_vertices_for_cell(edge_ids)
@@ -1825,10 +1998,7 @@ class NN_Trainer:
         self._tb_add_scalar("Loss/Compliance", row["loss_comp"], step)
 
         self._tb_add_scalar("Physics/ComplianceRaw", row["comp"], step)
-        self._tb_add_scalar("Physics/VolumeFraction", row["vol_frac"], step)
-        self._tb_add_scalar("Physics/VF_total", row["VF_total"], step)
-        self._tb_add_scalar("Physics/VF_eff_total", row["VF_eff_total"], step)
-        self._tb_add_scalar("Physics/VolumeFractionEffective", row["vol_frac_eff"], step)
+        self._tb_add_scalar("Physics/VolFrac", row["VolFrac"], step)
         self._tb_add_scalar("Physics/VolumeDeviation", row["vol_dev"], step)
         self._tb_add_scalar("Physics/VolumeDeviationEffective", row["vol_dev_eff"], step)
         self._tb_add_scalar("Physics/WGeoMean", row["w_geo_mean"], step)
@@ -1848,9 +2018,7 @@ class NN_Trainer:
             1.0 if row["optimizer_step_skipped"] else 0.0,
             step,
         )
-        self._tb_add_scalar("Geometry/HMean", row["h_mean"], step)
         self._tb_add_scalar("Geometry/CenterlineRadius", row["centerline_radius_mean"], step)
-        self._tb_add_scalar("Train/Tau", row["tau"], step)
         self._tb_add_scalar("Train/BestHardScore", row["best_hard_score"], step)
         self._tb_add_scalar("Train/BestHardStep", row["best_hard_step"], step)
 
@@ -1878,29 +2046,13 @@ class NN_Trainer:
                     w_geo_vals.append(self._pair_upper_values(p["w_geo"]))
             if len(w_geo_vals) > 0:
                 self._tb_add_histogram("Geometry/WGeo", torch.cat(w_geo_vals, dim=0), step)
-            h_vals = []
             centerline_radius_vals = []
 
             for p in pred_list:
-                if "h" in p and p["h"] is not None:
-                    h_vals.append(p["h"].reshape(-1))
                 if "centerline_radius" in p and p["centerline_radius"] is not None:
                     centerline_radius_vals.append(p["centerline_radius"].reshape(-1))
 
-            if h_vals: self._tb_add_histogram("Geometry/HHist", torch.cat(h_vals, dim=0), step)
             if centerline_radius_vals: self._tb_add_histogram("Geometry/CenterlineRadiusHist", torch.cat(centerline_radius_vals, dim=0), step)
-
-            tau_vals = []
-            for p in pred_list:
-                if p.get("tau") is not None:
-                    tau_value = p["tau"]
-                    if isinstance(tau_value, torch.Tensor):
-                        tau_vals.append(tau_value.reshape(-1))
-                    else:
-                        tau_vals.append(torch.as_tensor([float(tau_value)]))
-
-            if tau_vals:
-                self._tb_add_histogram("Train/TauHist", torch.cat(tau_vals, dim=0), step)
 
         if self.last_fem_debug:
             dbg = self.last_fem_debug
@@ -2098,11 +2250,27 @@ class NN_Trainer:
     @staticmethod
     def _volume_metric_definitions() -> dict[str, str]:
         return {
-            "VF_total": "Total volume fraction. Area-weighted mean density of the full shell field, including boundary attachment.",
-            "VF_eff_total": "Efficient total volume fraction. Area-weighted mean of the powered full shell density; lower density material contributes less.",
-            "VF_int": "Interior (Voronoi edges only) volume fraction. Area-weighted mean density of the interior Voronoi-edge field without boundary attachment.",
-            "VF_eff_int": "Efficient Interior (Voronoi edges only) volume fraction. Area-weighted mean of the powered interior Voronoi-edge density.",
+            "VolFrac": "Material volume fraction used by the current method for optimization and reporting.",
         }
+
+    @staticmethod
+    def _sanitize_history_rows(history: list[dict]) -> list[dict]:
+        obsolete_keys = {
+            "VF_total",
+            "VF_eff_total",
+            "VF_int",
+            "VF_eff_int",
+            "vol_frac",
+            "vol_frac_internal",
+            "vol_frac_eff_total",
+            "vol_frac_eff",
+            "tau",
+            "h_mean",
+        }
+        return [
+            {key: value for key, value in row.items() if key not in obsolete_keys}
+            for row in list(history or [])
+        ]
 
     def _save_optimization_logs(
         self,
@@ -2125,19 +2293,36 @@ class NN_Trainer:
             f.write("Training Parameters\n")
             f.write("===================\n")
             for key, value in sorted(asdict(self.cfg).items()):
-                f.write(f"{key}: {value}\n")
+                if key == "min_active_seeds":
+                    f.write(f"min_active_units: {value}\n")
+                else:
+                    f.write(f"{key}: {value}\n")
 
         definitions_path = os.path.join(log_dir, "volume_metric_definitions.txt")
         with open(definitions_path, "w", encoding="utf-8") as f:
             f.write("Volume Metric Definitions\n")
             f.write("=========================\n")
-            f.write("Legacy names in older logs:\n")
-            f.write("Tot_VolFrac = VF_total\n")
-            f.write("HVD_OFRAC / HVD_VolFrac = VF_int\n")
-            f.write("EFF_volfrac / Eff_VolFrac = VF_eff_int\n\n")
             for key, description in self._volume_metric_definitions().items():
                 f.write(f"{key}: {description}\n")
 
+        clean_history = self._sanitize_history_rows(history)
+        clean_best_row = self._sanitize_history_rows([best_row or {}])[0]
+        solution_metric_keys = [
+            "minimum_length",
+            "maximum_length",
+            "mean_length",
+            "standard_deviation",
+            "coefficient_of_variation",
+            "maximum_minimum_ratio",
+            "minimum_seed_distance",
+            "number_of_edges",
+            "topology_identifier",
+        ]
+        best_solution_metrics = {
+            key: clean_best_row.get(key)
+            for key in solution_metric_keys
+            if key in clean_best_row
+        }
         summary = {
             "best_score": best_score,
             "best_step": best_step,
@@ -2145,23 +2330,24 @@ class NN_Trainer:
             "computation_time": self._format_elapsed_time(computation_time_sec),
             "computation_time_seconds": computation_time_sec,
             "volume_metrics": self._volume_metric_definitions(),
-            "best_row": best_row or {},
+            "best_solution_metrics": best_solution_metrics,
+            "best_row": clean_best_row,
         }
         summary_path = os.path.join(log_dir, "optimization_summary.json")
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, sort_keys=True)
 
         history_path = os.path.join(log_dir, "optimization_history.csv")
-        if history:
+        if clean_history:
             fieldnames = []
-            for row in history:
+            for row in clean_history:
                 for key in row.keys():
                     if key not in fieldnames:
                         fieldnames.append(key)
             with open(history_path, "w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
-                writer.writerows(history)
+                writer.writerows(clean_history)
         else:
             with open(history_path, "w", encoding="utf-8", newline="") as f:
                 f.write("")
@@ -2202,7 +2388,6 @@ class NN_Trainer:
         params = [
             f"seed positions ({int(cfg.seed_number)})",
             "global strut width" if not cfg.freeze_w else f"width fixed={float(cfg.w_const):.6g}",
-            f"tau={self._fallback_tau_value():.6g}",
         ]
         return "Optimized: " + ", ".join(params)
 
@@ -2229,6 +2414,11 @@ class NN_Trainer:
                 "seeds_xyz": _clone_value(p.get("seeds_xyz")),
                 "edge_curves_uv": _clone_value(p.get("edge_curves_uv")),
                 "edge_curves_xyz": _clone_value(p.get("edge_curves_xyz")),
+                "edge_index": _clone_value(p.get("edge_index")),
+                "edge_seed_pair": _clone_value(p.get("edge_seed_pair")),
+                "edge_type": _clone_value(p.get("edge_type")),
+                "number_of_edges": p.get("number_of_edges"),
+                "topology_identifier": p.get("topology_identifier"),
             }
             for p in pred_list
         ]
@@ -3196,14 +3386,12 @@ class NN_Trainer:
         return NN_Trainer._composite_to_white(img)
 
     @staticmethod
-    def _add_image_title(img, title, pad=10, band_height=42):
+    def _add_image_title(img, title, pad=10, band_height=42, font_scale=0.72, thickness=2):
         if img.ndim != 3 or img.shape[2] != 3:
             return img
 
         title_band = np.full((band_height, img.shape[1], 3), 255, dtype=np.uint8)
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.72
-        thickness = 2
         text_size, baseline = cv2.getTextSize(title, font, font_scale, thickness)
         x = max(pad, (img.shape[1] - text_size[0]) // 2)
         y = max(pad + text_size[1], (band_height + text_size[1]) // 2 - baseline)
@@ -3666,6 +3854,10 @@ class NN_Trainer:
         pred_list,
         render_cache,
         loading_img=None,
+        fem_density_field=None,
+        fem_stress_field=None,
+        fem_displacement_field=None,
+        history_rows=None,
     ):
         import numpy as np
         import pyvista as pv
@@ -3808,8 +4000,300 @@ class NN_Trainer:
             )
         )
 
+        def _field_to_vtk_cell_order(field):
+            if field is None or self.shell_problem is None:
+                return None
+            if torch.is_tensor(field):
+                field = field.detach().cpu().numpy()
+            field = np.asarray(field, dtype=np.float32).reshape(-1)
+            mesh_cfg = getattr(self.shell_problem, "mesh", None)
+            if mesh_cfg is None or getattr(self.shell_problem, "grid_geom", None) is None:
+                return None
+            nelx, nely, nelz = int(mesh_cfg["nelx"]), int(mesh_cfg["nely"]), int(mesh_cfg["nelz"])
+            if field.size != nelx * nely * nelz:
+                return None
+            return field.reshape((nelz, nelx, nely)).transpose(1, 2, 0).ravel(order="F")
+
+        def _occupied_cell_mask_vtk():
+            if self.shell_problem is None or getattr(self.shell_problem, "elem_occupancy", None) is None:
+                return None
+            occ = np.asarray(self.shell_problem.elem_occupancy, dtype=np.uint8)
+            return occ.transpose(1, 2, 0).ravel(order="F")
+
+        def _render_fem_cell_field(
+            field,
+            title,
+            scalar_name,
+            cmap,
+            clim=None,
+            window_size=(900, 650),
+            density_mask_field=None,
+            density_threshold=None,
+            colorbar_label=None,
+            title_font_scale=0.86,
+        ):
+            values = _field_to_vtk_cell_order(field)
+            if values is None:
+                return None
+            density_values = _field_to_vtk_cell_order(density_mask_field)
+            mesh_cfg = self.shell_problem.mesh
+            grid_geom = self.shell_problem.grid_geom
+            nelx, nely, nelz = int(mesh_cfg["nelx"]), int(mesh_cfg["nely"]), int(mesh_cfg["nelz"])
+            grid_cls = getattr(pv, "ImageData", None)
+            if grid_cls is None:
+                grid_cls = pv.UniformGrid
+            grid = grid_cls(
+                dimensions=(nelx + 1, nely + 1, nelz + 1),
+                spacing=(float(grid_geom["hx"]), float(grid_geom["hy"]), float(grid_geom["hz"])),
+                origin=(float(grid_geom["xmin"]), float(grid_geom["ymin"]), float(grid_geom["zmin"])),
+            )
+            grid.cell_data[scalar_name] = values
+            occ = _occupied_cell_mask_vtk()
+            visible = np.ones(values.shape, dtype=np.uint8)
+            if occ is not None and occ.size == values.size:
+                visible &= occ.astype(np.uint8)
+            if density_values is not None and density_values.size == values.size and density_threshold is not None:
+                visible &= (density_values >= float(density_threshold)).astype(np.uint8)
+            if visible.size == values.size:
+                grid.cell_data["visible"] = visible
+                mesh = grid.threshold(value=0.5, scalars="visible")
+            else:
+                mesh = grid
+            if mesh.n_cells <= 0:
+                return None
+
+            range_values = values
+            if visible.size == values.size:
+                range_values = values[visible.astype(bool)]
+            finite = range_values[np.isfinite(range_values)]
+            if clim is None:
+                if finite.size > 0:
+                    vmax = float(np.quantile(finite, 0.98))
+                    if vmax <= 0.0:
+                        vmax = float(np.max(finite)) if finite.size else 1.0
+                    clim = [0.0, max(vmax, 1e-8)]
+                else:
+                    clim = [0.0, 1.0]
+
+            pl = pv.Plotter(off_screen=True, window_size=window_size)
+            pl.set_background("white")
+            try:
+                pl.disable_anti_aliasing()
+                pl.ren_win.SetMultiSamples(0)
+            except Exception:
+                pass
+            pl.add_mesh(
+                mesh,
+                scalars=scalar_name,
+                cmap=cmap,
+                clim=clim,
+                show_edges=False,
+                lighting=False,
+                smooth_shading=False,
+                nan_color="white",
+                scalar_bar_args={
+                    "title": colorbar_label or scalar_name,
+                    "position_x": 0.08,
+                    "position_y": 0.02,
+                    "width": 0.86,
+                    "height": 0.14,
+                    "title_font_size": 34,
+                    "label_font_size": 30,
+                    "fmt": "%.2g",
+                    "n_labels": 5,
+                },
+            )
+            pl.view_isometric()
+            pl.reset_camera()
+            try:
+                pl.camera.zoom(0.94)
+            except Exception:
+                pass
+            field_img = self._composite_to_white(pl.screenshot(return_img=True, transparent_background=False))
+            pl.close()
+            return self._add_panel_border(
+                self._add_image_title(
+                    field_img,
+                    title,
+                    band_height=54,
+                    font_scale=title_font_scale,
+                    thickness=2,
+                )
+            )
+
+        def _history_cap(key, default=1.0):
+            vals = []
+            for row in list(history_rows or []):
+                try:
+                    value = float(row.get(key, float("nan")))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value > 0.0:
+                    vals.append(value)
+            if not vals:
+                return float(default)
+            return max(max(vals), 1e-8)
+
+        stress_vmax = _history_cap("stress_p99", default=1.0)
+        disp_vmax = _history_cap("disp_field_p99", default=_history_cap("disp_p99", default=1.0))
+        stress_normalize = Normalize(vmin=0.0, vmax=stress_vmax, clip=True)
+        disp_normalize = Normalize(vmin=0.0, vmax=disp_vmax, clip=True)
+
+        density_img = _render_fem_cell_field(
+            fem_density_field,
+            "3D FEM Density Distribution",
+            "density",
+            "viridis",
+            clim=[0.0, 1.0],
+            window_size=(1150, 820),
+            colorbar_label="density",
+        )
+        stress_img = _render_fem_cell_field(
+            fem_stress_field,
+            "FEM Stress Diagnostic (Material Only)",
+            "stress",
+            "turbo",
+            #clim=[float(stress_normalize.vmin), float(stress_normalize.vmax)],
+            window_size=(1150, 820),
+            density_mask_field=fem_density_field,
+            density_threshold=max(float(getattr(self.cfg, "vis_thr", 0.5)), float(getattr(self.cfg, "fem_density_floor", 0.02)) * 1.05),
+            colorbar_label="stress, capped P99",
+        )
+        displacement_img = _render_fem_cell_field(
+            fem_displacement_field,
+            "FEM Displacement in Load Direction",
+            "u_load",
+            "plasma",
+            #clim=[float(disp_normalize.vmin), float(disp_normalize.vmax)],
+            window_size=(1150, 820),
+            density_mask_field=fem_density_field,
+            density_threshold=max(float(getattr(self.cfg, "vis_thr", 0.5)), float(getattr(self.cfg, "fem_density_floor", 0.02)) * 1.05),
+            colorbar_label="u_load, capped P99",
+        )
+
+        def _history_ylim(keys, log_y=False):
+            vals = []
+            for row in list(history_rows or []):
+                for key in keys:
+                    try:
+                        value = float(row.get(key, float("nan")))
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value) and (not log_y or value > 0.0):
+                        vals.append(value)
+            if not vals:
+                return None
+            vmin = min(vals)
+            vmax = max(vals)
+            if log_y:
+                return [max(vmin * 0.9, 1e-12), max(vmax * 1.1, 1e-12)]
+            if abs(vmax - vmin) < 1e-12:
+                pad = max(abs(vmax) * 0.05, 0.05)
+                return [vmin - pad, vmax + pad]
+            pad = 0.06 * (vmax - vmin)
+            return [vmin - pad, vmax + pad]
+
+        def _render_history_plot(history_rows, keys, title, ylabel, colors=None, log_y=False, ylim=None, window_size=(900, 360)):
+            width, height = int(window_size[0]), int(window_size[1])
+            rows = list(history_rows or [])
+            fig = plt.figure(figsize=(width / 100, height / 100), dpi=100, facecolor="white")
+            ax = fig.add_subplot(111)
+            ax.set_facecolor("white")
+            colors = colors or ["#2563eb", "#dc2626", "#16a34a"]
+            plotted = False
+            for idx, key in enumerate(keys):
+                xs = []
+                ys = []
+                for row in rows:
+                    if key not in row:
+                        continue
+                    value = row.get(key)
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(value):
+                        continue
+                    if log_y and value <= 0.0:
+                        continue
+                    xs.append(float(row.get("step", len(xs))))
+                    ys.append(value)
+                if xs:
+                    label = key.replace("loss_fem", "L_FEM").replace("comp", "Compliance").replace("_", " ")
+                    ax.plot(xs, ys, color=colors[idx % len(colors)], linewidth=2.4, label=label)
+                    plotted = True
+            if not plotted:
+                ax.text(0.5, 0.5, "No history yet", ha="center", va="center", transform=ax.transAxes, fontsize=14)
+            if log_y and plotted:
+                ax.set_yscale("log")
+            if plotted and ylim is not None:
+                ax.set_ylim(ylim)
+            ax.set_title(title, fontsize=18, weight="bold", pad=8)
+            ax.set_xlabel("Iteration", fontsize=13)
+            ax.set_ylabel(ylabel, fontsize=13)
+            ax.grid(True, color="#d1d5db", linewidth=0.8, alpha=0.75)
+            ax.tick_params(axis="both", labelsize=11)
+            if plotted and len(keys) > 1:
+                ax.legend(loc="best", fontsize=10, frameon=True)
+            for spine in ("top", "right"):
+                ax.spines[spine].set_visible(False)
+            fig.tight_layout(pad=1.2)
+            fig.canvas.draw()
+            img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+            img = img[..., :3].copy()
+            plt.close(fig)
+            return self._add_panel_border(img)
+
+        normalized_history_rows = []
+        total_loss_baseline = None
+        for row in list(history_rows or []):
+            try:
+                value = float(row.get("L_total", float("nan")))
+            except (TypeError, ValueError):
+                value = float("nan")
+            if math.isfinite(value) and abs(value) > 1e-12:
+                total_loss_baseline = abs(value)
+                break
+        for row in list(history_rows or []):
+            plot_row = dict(row)
+            if total_loss_baseline is not None:
+                try:
+                    value = float(row.get("L_total", float("nan")))
+                except (TypeError, ValueError):
+                    value = float("nan")
+                if math.isfinite(value):
+                    plot_row["L_total_norm"] = value / total_loss_baseline
+            normalized_history_rows.append(plot_row)
+
+        total_loss_hist_img = _render_history_plot(
+            normalized_history_rows,
+            keys=["L_total_norm"],
+            title="Normalized Total Loss History",
+            ylabel="Normalized Total Loss",
+            colors=["#dc2626"],
+            ylim=[0.0, 2.0],
+        )
+        compliance_hist_img = _render_history_plot(
+            normalized_history_rows,
+            keys=["L_FEM_norm"],
+            title="Normalized Compliance History",
+            ylabel="Normalized Compliance",
+            colors=["#2563eb"],
+            ylim=[0.0, 2.0],
+        )
+        stress_hist_img = _render_history_plot(
+            normalized_history_rows,
+            keys=["stress_norm"],
+            title="Normalized Stress Diagnostic",
+            ylabel="Normalized Stress Diagnostic",
+            colors=["#0891b2"],
+            ylim=[0.0, 2.0],
+        )
+
         if first_face_voronoi_img is None or first_face_graph_img is None or first_face_core_curves_img is None:
-            return tube_img
+            panels = [p for p in [loading_img, tube_img, density_img, stress_img, displacement_img] if p is not None]
+            return self._stack_row_with_gaps(panels, gap=22) if panels else tube_img
 
         voronoi_img = self._add_panel_border(
             self._add_image_title(
@@ -3829,7 +4313,71 @@ class NN_Trainer:
                 "Core Curves UV",
             )
         )
-        frame = self._stack_row_with_gaps([voronoi_img, graph_img, core_curves_img, tube_img], gap=22)
+        def _fit_panel_to_box(img, width, height):
+            h, w = img.shape[:2]
+            scale = min(float(width) / max(float(w), 1.0), float(height) / max(float(h), 1.0))
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            resized = cv2.resize(img, (new_w, new_h), interpolation=interp)
+            out = np.full((int(height), int(width), 3), 255, dtype=np.uint8)
+            y0 = max((int(height) - new_h) // 2, 0)
+            x0 = max((int(width) - new_w) // 2, 0)
+            out[y0:y0 + new_h, x0:x0 + new_w] = resized[..., :3]
+            return out
+
+        generate_density_fiber = bool(getattr(self.cfg, "generate_decoder_density_fiber", True))
+
+        top_panels = []
+        if loading_img is not None:
+            loading_panel = cv2.resize(
+                loading_img,
+                (520, 300),
+                interpolation=cv2.INTER_AREA if loading_img.shape[1] > 520 else cv2.INTER_CUBIC,
+            )
+            top_panels.append(
+                self._add_panel_border(
+                    self._add_image_title(loading_panel, "Loading And Boundary Conditions")
+                )
+            )
+        if generate_density_fiber:
+            if loading_img is not None:
+                top_panels.extend([graph_img, tube_img])
+            else:
+                top_panels.extend([voronoi_img, graph_img, tube_img])
+        else:
+            top_panels.extend([voronoi_img, graph_img])
+        top_panels = top_panels[:3]
+
+        if generate_density_fiber:
+            bottom_panels = [p for p in [density_img, stress_img, displacement_img] if p is not None]
+            if not bottom_panels:
+                bottom_panels = [core_curves_img]
+            bottom_panels = bottom_panels[:3]
+        else:
+            bottom_panels = [core_curves_img, tube_img]
+
+        panel_w = 460
+        top_h = 280
+        fem_h = 520
+        hist_h = 240
+        col_gap = 22
+        row_gap = 22
+        top_row_imgs = [_fit_panel_to_box(p, panel_w, top_h) for p in top_panels]
+        fem_row_imgs = [_fit_panel_to_box(p, panel_w, fem_h) for p in bottom_panels]
+        if not generate_density_fiber and len(fem_row_imgs) == 2:
+            fem_row_imgs.insert(1, np.full((fem_h, panel_w, 3), 255, dtype=np.uint8))
+        hist_panels = [total_loss_hist_img, compliance_hist_img, stress_hist_img]
+        hist_row_imgs = [_fit_panel_to_box(p, panel_w, hist_h) for p in hist_panels]
+        top_row = self._stack_row_with_gaps(top_row_imgs, gap=col_gap)
+        fem_row = self._stack_row_with_gaps(fem_row_imgs, gap=col_gap)
+        hist_row = self._stack_row_with_gaps(hist_row_imgs, gap=col_gap)
+        target_w = max(top_row.shape[1], fem_row.shape[1], hist_row.shape[1])
+        top_row = self._pad_to_size(top_row, target_w=target_w)
+        fem_row = self._pad_to_size(fem_row, target_w=target_w)
+        hist_row = self._pad_to_size(hist_row, target_w=target_w)
+        gap_tile = np.full((row_gap, target_w, 3), 255, dtype=np.uint8)
+        frame = np.vstack([top_row, gap_tile, fem_row, gap_tile, hist_row])
         return cv2.copyMakeBorder(
             frame,
             16,
@@ -4014,7 +4562,6 @@ class NN_Trainer:
                 show_node_ids=show_node_ids,
                 show_edge_ids=show_edge_ids,
                 node_id_fontsize=7,
-                show_pruned_nodes=False,
                 color_by_edge_type=True,
             )
             ax.set_title("Generated Connectivity Graph", fontsize=12)
@@ -5352,6 +5899,9 @@ class NN_Trainer:
         best_fiber_surface = None
         best_seeds = None
         best_pred = None
+        best_fem_density_field = None
+        best_fem_stress_field = None
+        best_fem_displacement_field = None
         prune_best_score = float("inf")
         prune_best_step = -1
         prune_best_pred = None
@@ -5457,11 +6007,23 @@ class NN_Trainer:
                 compute_cell_edge_uniform_loss = (
                     getattr(cfg, "lam_cell_edge_uniform", 0.0) != 0.0
                 )
+                curve_only_training = (
+                    compute_curve_length_loss
+                    and cfg.lam_vol == 0.0
+                    and cfg.lam_fem == 0.0
+                    and cfg.lam_rep == 0.0
+                    and cfg.lam_bnd == 0.0
+                    and getattr(cfg, "lam_cell_edge_uniform", 0.0) == 0.0
+                )
 
                 # Determine whether to update seed anchors based on the configuration and current step, seed anchors are reference points used in the training process.
                 # if it is on, it will update the seed anchors after a certain warmup period, and the update is allowed based on the configuration settings.
                 update_seed_anchors = (
                     cfg.use_rolling_seed_anchors
+                    and not (
+                        curve_only_training
+                        and bool(getattr(cfg, "disable_rolling_seed_anchors_for_curve_only", True))
+                    )
                     and step >= int(round(float(cfg.seed_anchor_warmup_frac) * float(cfg.num_steps)))
                     and (anchor_update_allowed or not cfg.guard_seed_anchor_updates)
                 )
@@ -5520,8 +6082,16 @@ class NN_Trainer:
                         ],
                     )
 
+                    reported_curve_lengths_i = self.curve_3d_edge_lengths(
+                        decoder_out,
+                        edge_types=getattr(cfg, "curve_length_report_edge_types", (0,)),
+                    ).detach()
+                    curve_length_values.append(reported_curve_lengths_i)
+                    topology_metrics_i = self.solution_topology_metrics(
+                        decoder_out,
+                        curve_lengths=reported_curve_lengths_i,
+                    )
                     if compute_curve_length_loss:
-                        curve_length_values.append(self.curve_3d_edge_lengths(decoder_out).detach())
                         curve_length_terms.append(self.curve_length_similarity_loss(decoder_out))
                     if compute_cell_edge_uniform_loss:
                         cell_edge_uniform_terms.append(
@@ -5621,6 +6191,11 @@ class NN_Trainer:
                         "seeds_xyz": decoder_out["seeds_xyz"].detach().clone() if isinstance(decoder_out.get("seeds_xyz"), torch.Tensor) else None,
                         "edge_curves_uv": decoder_out["edge_curves_uv"].detach().clone() if isinstance(decoder_out.get("edge_curves_uv"), torch.Tensor) else None,
                         "edge_curves_xyz": decoder_out["edge_curves_xyz"].detach().clone() if isinstance(decoder_out.get("edge_curves_xyz"), torch.Tensor) else None,
+                        "edge_index": decoder_out["graph"]["edge_index"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_index"), torch.Tensor) else None,
+                        "edge_seed_pair": decoder_out["graph"]["edge_seed_pair"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_seed_pair"), torch.Tensor) else None,
+                        "edge_type": decoder_out["graph"]["edge_type"].detach().clone() if isinstance(decoder_out.get("graph"), dict) and isinstance(decoder_out["graph"].get("edge_type"), torch.Tensor) else None,
+                        "number_of_edges": int(topology_metrics_i["number_of_edges"]),
+                        "topology_identifier": topology_metrics_i["topology_identifier"],
                     })
 
                     if compute_rep_loss:
@@ -5711,7 +6286,7 @@ class NN_Trainer:
                 vol_frac_eff = vol_frac_eff_total
                 loss_vol = zero
 
-                if compute_vol_loss:
+                if compute_vol_loss and cfg.generate_decoder_density_fiber:
                     loss_vol_total = self.loss_volume(
                         rho=rho,
                         A_v=A_v,
@@ -5739,9 +6314,13 @@ class NN_Trainer:
                     "compliance_loss": torch.zeros((), dtype=dtype, device=device),
                     "fem_valid": True,
                     "failure_reason": None,
+                    "density_field": None,
+                    "stress_field": None,
+                    "displacement_field": None,
+                    "loaded_boundary_displacement_field": None,
                 }
 
-                if cfg.lam_fem != 0.0:
+                if cfg.lam_fem != 0.0 and cfg.generate_decoder_density_fiber:
                     fem_out = self.loss_fem.evaluate(
                         rho_surface=rho,
                         fiber_surface=fiber_surface,
@@ -5756,6 +6335,73 @@ class NN_Trainer:
                 comp_val = fem_out["comp"]
                 fem_is_valid = bool(fem_out["fem_valid"])
                 fem_failure_reason = fem_out["failure_reason"]
+                fem_density_field = fem_out.get("density_field", None)
+                fem_stress_field = fem_out.get("stress_field", None)
+                fem_displacement_field = fem_out.get("displacement_field", None)
+                fem_loaded_boundary_displacement_field = fem_out.get("loaded_boundary_displacement_field", None)
+                stress_density_threshold = max(
+                    float(getattr(cfg, "vis_thr", 0.5)),
+                    float(getattr(cfg, "fem_density_floor", 0.02)) * 1.05,
+                )
+                if isinstance(fem_stress_field, torch.Tensor) and fem_stress_field.numel() > 0:
+                    finite_stress = fem_stress_field.detach().reshape(-1)
+                    if (
+                        isinstance(fem_density_field, torch.Tensor)
+                        and fem_density_field.numel() == fem_stress_field.numel()
+                    ):
+                        finite_stress = finite_stress[
+                            fem_density_field.detach().reshape(-1) >= stress_density_threshold
+                        ]
+                    finite_stress = finite_stress[torch.isfinite(finite_stress)]
+                    if finite_stress.numel() > 0:
+                        stress_max = float(finite_stress.max().item())
+                        stress_p95 = float(torch.quantile(finite_stress, 0.95).item())
+                        stress_p99 = float(torch.quantile(finite_stress, 0.99).item())
+                    else:
+                        stress_max = float("nan")
+                        stress_p95 = float("nan")
+                        stress_p99 = float("nan")
+                else:
+                    stress_max = float("nan")
+                    stress_p95 = float("nan")
+                    stress_p99 = float("nan")
+                if isinstance(fem_displacement_field, torch.Tensor) and fem_displacement_field.numel() > 0:
+                    finite_disp_field = fem_displacement_field.detach().reshape(-1)
+                    finite_disp_field = finite_disp_field[torch.isfinite(finite_disp_field)]
+                    if finite_disp_field.numel() > 0:
+                        disp_field_max = float(finite_disp_field.max().item())
+                        disp_field_p95 = float(torch.quantile(finite_disp_field, 0.95).item())
+                        disp_field_p99 = float(torch.quantile(finite_disp_field, 0.99).item())
+                    else:
+                        disp_field_max = float("nan")
+                        disp_field_p95 = float("nan")
+                        disp_field_p99 = float("nan")
+                else:
+                    disp_field_max = float("nan")
+                    disp_field_p95 = float("nan")
+                    disp_field_p99 = float("nan")
+
+                disp_metric_source = fem_loaded_boundary_displacement_field
+                if not isinstance(disp_metric_source, torch.Tensor) or disp_metric_source.numel() <= 0:
+                    disp_metric_source = fem_displacement_field
+                if isinstance(disp_metric_source, torch.Tensor) and disp_metric_source.numel() > 0:
+                    finite_disp_metric = disp_metric_source.detach().reshape(-1)
+                    finite_disp_metric = finite_disp_metric[torch.isfinite(finite_disp_metric)]
+                    if finite_disp_metric.numel() > 0:
+                        disp_mean = float(finite_disp_metric.mean().item())
+                        disp_max = float(finite_disp_metric.max().item())
+                        disp_p95 = float(torch.quantile(finite_disp_metric, 0.95).item())
+                        disp_p99 = float(torch.quantile(finite_disp_metric, 0.99).item())
+                    else:
+                        disp_mean = float("nan")
+                        disp_max = float("nan")
+                        disp_p95 = float("nan")
+                        disp_p99 = float("nan")
+                else:
+                    disp_mean = float("nan")
+                    disp_max = float("nan")
+                    disp_p95 = float("nan")
+                    disp_p99 = float("nan")
 
                 # ----------------------------------------------------
                 # Normalize losses
@@ -5933,7 +6579,15 @@ class NN_Trainer:
                     if best_candidate_is_valid and score < (best_score - cfg.min_delta):
                         best_score = score
                         best_step = step
-                        best_vol_frac = float(vol_frac_eff.detach().item())
+                        best_vol_frac = float(
+                            (
+                                vol_frac_eff
+                                if bool(getattr(cfg, "use_effective_volume_constraint", True))
+                                else vol_frac
+                            )
+                            .detach()
+                            .item()
+                        )
                         best_comp = float(comp_val.detach().item())
                         best_w_geo = float(w_geo_mean.detach().item())
                         best_active_count = float(participating_count_total)
@@ -5942,15 +6596,33 @@ class NN_Trainer:
                         best_fiber_surface = fiber_surface.detach().clone()
                         best_seeds = [s.detach().clone() for s in seeds_list]
                         best_pred = self._clone_pred_list(pred_list)
+                        best_fem_density_field = (
+                            fem_density_field.detach().clone()
+                            if isinstance(fem_density_field, torch.Tensor)
+                            else None
+                        )
+                        best_fem_stress_field = (
+                            fem_stress_field.detach().clone()
+                            if isinstance(fem_stress_field, torch.Tensor)
+                            else None
+                        )
+                        best_fem_displacement_field = (
+                            fem_displacement_field.detach().clone()
+                            if isinstance(fem_displacement_field, torch.Tensor)
+                            else None
+                        )
 
                         if improvement_gap is None or improvement_gap > 50:
+                            best_volfrac_report = (
+                                float(vol_frac_eff.detach().item())
+                                if bool(getattr(cfg, "use_effective_volume_constraint", True))
+                                else float(vol_frac.detach().item())
+                            )
                             tqdm.write(
                                 f"New best_step={best_step} | "
                                 f"best_score={best_score:.6f} | "
-                                f"best_active_count={best_active_count:.1f} | "
-                                f"VF_total={float(vol_frac.detach().item()):.6f} | "
-                                f"VF_eff_total={float(vol_frac_eff_total.detach().item()):.6f} | "
-                                f"VF_eff_int={best_vol_frac:.6f} | "
+                                f"best_active_units={best_active_count:.1f} | "
+                                f"VolFrac={best_volfrac_report:.6f} | "
                                 f"comp={best_comp:.6e} | "
                                 f"w={best_w_geo:.6e}"
                             )
@@ -5978,10 +6650,29 @@ class NN_Trainer:
                         curve_length_min = float(curve_lengths.min().item())
                         curve_length_max = float(curve_lengths.max().item())
                         curve_length_mean = float(curve_lengths.mean().item())
+                        curve_length_std = float(curve_lengths.std(unbiased=False).item())
+                        curve_length_cv = (
+                            curve_length_std / curve_length_mean
+                            if math.isfinite(curve_length_mean) and abs(curve_length_mean) > float(cfg.eps)
+                            else float("nan")
+                        )
+                        curve_length_ratio = curve_length_max / max(curve_length_min, float(cfg.eps))
                     else:
                         curve_length_min = float("nan")
                         curve_length_max = float("nan")
                         curve_length_mean = float("nan")
+                        curve_length_std = float("nan")
+                        curve_length_cv = float("nan")
+                        curve_length_ratio = float("nan")
+                    solution_metrics = dict(topology_metrics_i)
+                    solution_metrics.update({
+                        "minimum_length": curve_length_min,
+                        "maximum_length": curve_length_max,
+                        "mean_length": curve_length_mean,
+                        "standard_deviation": curve_length_std,
+                        "coefficient_of_variation": curve_length_cv,
+                        "maximum_minimum_ratio": curve_length_ratio,
+                    })
 
                     g_mean = 0.0
                     g_count = 0
@@ -5990,6 +6681,65 @@ class NN_Trainer:
                             g_mean += float(p.grad.detach().abs().mean().item())
                             g_count += 1
                     g_mean = g_mean / max(g_count, 1)
+
+                    volfrac_value = vol_frac_eff if bool(getattr(cfg, "use_effective_volume_constraint", True)) else vol_frac
+                    volfrac_scalar = float(volfrac_value.detach().item())
+                    l_fem_current = self._finite_or_default(loss_fem)
+                    l_fem_initial = next(
+                        (
+                            float(r["loss_fem"])
+                            for r in history
+                            if math.isfinite(float(r.get("loss_fem", float("nan"))))
+                            and float(r.get("loss_fem", float("nan"))) > 0.0
+                        ),
+                        l_fem_current,
+                    )
+                    l_fem_candidates = [
+                        float(r["loss_fem"])
+                        for r in history
+                        if math.isfinite(float(r.get("loss_fem", float("nan"))))
+                    ]
+                    if math.isfinite(float(l_fem_current)):
+                        l_fem_candidates.append(l_fem_current)
+                    best_l_fem_so_far = min(l_fem_candidates) if l_fem_candidates else float("nan")
+                    disp_mean_initial = next(
+                        (
+                            float(r["disp_mean"])
+                            for r in history
+                            if math.isfinite(float(r.get("disp_mean", float("nan"))))
+                            and float(r.get("disp_mean", float("nan"))) > 0.0
+                        ),
+                        disp_mean,
+                    )
+                    stress_p95_initial = next(
+                        (
+                            float(r["stress_p95"])
+                            for r in history
+                            if math.isfinite(float(r.get("stress_p95", float("nan"))))
+                            and float(r.get("stress_p95", float("nan"))) > 0.0
+                        ),
+                        stress_p95,
+                    )
+                    compliance_reduction_pct = (
+                        100.0 * (l_fem_initial - best_l_fem_so_far) / l_fem_initial
+                        if math.isfinite(float(l_fem_initial)) and l_fem_initial > 0.0 and math.isfinite(float(best_l_fem_so_far))
+                        else float("nan")
+                    )
+                    l_fem_norm = (
+                        l_fem_current / l_fem_initial
+                        if math.isfinite(float(l_fem_initial)) and l_fem_initial > 0.0
+                        else float("nan")
+                    )
+                    disp_norm = (
+                        disp_mean / disp_mean_initial
+                        if math.isfinite(float(disp_mean_initial)) and disp_mean_initial > 0.0 and math.isfinite(float(disp_mean))
+                        else float("nan")
+                    )
+                    stress_norm = (
+                        stress_p95 / stress_p95_initial
+                        if math.isfinite(float(stress_p95_initial)) and stress_p95_initial > 0.0 and math.isfinite(float(stress_p95))
+                        else float("nan")
+                    )
 
                     row = {
                         "step": step,
@@ -6001,21 +6751,41 @@ class NN_Trainer:
                         "curve_length_min": curve_length_min,
                         "curve_length_max": curve_length_max,
                         "curve_length_mean": curve_length_mean,
+                        "curve_length_std": curve_length_std,
+                        "curve_length_cv": curve_length_cv,
+                        "curve_length_ratio": curve_length_ratio,
+                        "minimum_length": solution_metrics["minimum_length"],
+                        "maximum_length": solution_metrics["maximum_length"],
+                        "mean_length": solution_metrics["mean_length"],
+                        "standard_deviation": solution_metrics["standard_deviation"],
+                        "coefficient_of_variation": solution_metrics["coefficient_of_variation"],
+                        "maximum_minimum_ratio": solution_metrics["maximum_minimum_ratio"],
+                        "minimum_seed_distance": min_seed_dist,
+                        "number_of_edges": solution_metrics["number_of_edges"],
+                        "topology_identifier": solution_metrics["topology_identifier"],
                         "loss_cell_edge_uniform": self._finite_or_default(loss_cell_edge_uniform),
-                        "loss_fem": self._finite_or_default(loss_fem),
+                        "loss_fem": l_fem_current,
                         "loss_comp": self._finite_or_default(loss_comp),
                         "comp": self._finite_or_default(comp_val),
-                        "vol_frac": float(vol_frac.detach().item()),
-                        "vol_frac_internal": float(vol_frac.detach().item()),
-                        "vol_frac_eff_total": float(vol_frac_eff_total.detach().item()),
-                        "vol_frac_eff": float(vol_frac_eff.detach().item()),
-                        "VF_total": float(vol_frac.detach().item()),
-                        "VF_eff_total": float(vol_frac_eff_total.detach().item()),
-                        "VF_int": float(vol_frac.detach().item()),
-                        "VF_eff_int": float(vol_frac_eff.detach().item()),
+                        "stress_max": stress_max,
+                        "stress_p95": stress_p95,
+                        "stress_p99": stress_p99,
+                        "stress_norm": stress_norm,
+                        "disp_field_max": disp_field_max,
+                        "disp_field_p95": disp_field_p95,
+                        "disp_field_p99": disp_field_p99,
+                        "disp_mean": disp_mean,
+                        "disp_max": disp_max,
+                        "disp_p95": disp_p95,
+                        "disp_p99": disp_p99,
+                        "disp_norm": disp_norm,
+                        "VolFrac": volfrac_scalar,
+                        "L_FEM_initial": l_fem_initial,
+                        "L_FEM_best": best_l_fem_so_far,
+                        "L_FEM_norm": l_fem_norm,
+                        "compliance_reduction_pct": compliance_reduction_pct,
                         "vol_dev": float(vol_dev.detach().item()),
                         "vol_dev_eff": float(vol_dev_eff.detach().item()),
-                        "tau": float(tau_step),
                         "seed_offset_scale": float(seed_offset_scale_step),
                         "rho_min": rho_min,
                         "rho_mean": rho_mean,
@@ -6040,15 +6810,14 @@ class NN_Trainer:
                         "fem_failure_reason": fem_failure_reason,
                         "optimizer_step_skipped": not total_is_finite,
                         "w_geo_mean": self._finite_or_default(w_geo_mean),
-                        "h_mean": self._finite_or_default(h_mean),
                         "centerline_radius_mean": self._finite_or_default(centerline_radius_mean),
 
-                        "active_count_total": participating_count_total,
-                        "active_count_mean": participating_count_mean,
-                        "active_frac_mean": participating_frac_mean,
-                        "inactive_count_total": inactive_count_total,
-                        "inactive_count_mean": inactive_count_mean,
-                        "inactive_frac_mean": inactive_frac_mean,
+                        "active_units_total": participating_count_total,
+                        "active_units_mean": participating_count_mean,
+                        "active_units_frac_mean": participating_frac_mean,
+                        "inactive_units_total": inactive_count_total,
+                        "inactive_units_mean": inactive_count_mean,
+                        "inactive_units_frac_mean": inactive_frac_mean,
                         "anchor_update_allowed": 1.0 if anchor_update_allowed else 0.0,
                         "collapse_active": (
                             1.0
@@ -6060,9 +6829,8 @@ class NN_Trainer:
 
                     pbar.set_postfix(
                         loss=f"{row['L_total']:.3e}",
-                        vol=f"{row['vol_frac_eff']:.3f}",
+                        vol=f"{row['VolFrac']:.3f}",
                         comp=f"{row['comp']:.2e}",
-                        tau=f"{row['tau']:.2e}",
                         w=f"{row['w_geo_mean']:.3e}",
                         clr=f"{row['centerline_radius_mean']:.3e}",
                         lcurve=f"{row['loss_curve_length']:.2e}",
@@ -6081,6 +6849,10 @@ class NN_Trainer:
                                 pred_list=pred_list,
                                 render_cache=render_cache,
                                 loading_img=self.timelapse_loading_img,
+                                fem_density_field=fem_density_field,
+                                fem_stress_field=fem_stress_field,
+                                fem_displacement_field=fem_displacement_field,
+                                history_rows=history,
                             )
                         else:
                             cad_img = self._render_current_cad_frame_cached(
@@ -6107,16 +6879,16 @@ class NN_Trainer:
                             cad_img=cad_img,
                             loss_dict=loss_dict,
                             title_text=(
-                                f"VF_total={row['VF_total']:.4f} | "
-                                f"VF_eff_total={row['VF_eff_total']:.4f} | "
-                                f"VF_int={row['VF_int']:.4f} | "
-                                f"VF_eff_int={row['VF_eff_int']:.4f} | "
-                                f"W={row['w_geo_mean']:.4g} | "
-                                f"CLR={row['centerline_radius_mean']:.4g} | "
-                                f"tau={row['tau']:.4g} | "
-                                f"act={row['active_count_total']:.0f} | "
-                                f"Δrho={drho:.2e} Δseed={dseed:.2e} "
-                                f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
+                                f"L_FEM={row['loss_fem']:.2f} | "
+                                f"Best Step={int(row['best_step'])} | "
+                                f"Best L_FEM={row['L_FEM_best']:.2f} | "
+                                f"Com. Red. ={row['compliance_reduction_pct']:.1f}% | "
+                                f"VolFrac={row['VolFrac']:.2f} | "
+                                f"L_FEM_norm={row['L_FEM_norm']:.2f} | "
+                                f"disp_norm={row['disp_norm']:.2f} | "
+                                f"stress_norm={row['stress_norm']:.2f} | "
+                                f"W={row['w_geo_mean']:.2f} | "
+                                f"Active Units={row['active_units_total']:.0f} | "
                             ),
                         )
 
@@ -6136,7 +6908,7 @@ class NN_Trainer:
                         fem_status = "OK" if fem_is_valid else f"BAD({fem_failure_reason})"
                         tqdm.write(
                             f"[{step:05d}] | "
-                            f"Active Seeds/Total={participating_count_total:.0f}/{participating_count_total+inactive_count_total:.0f} | "
+                            f"Active Units/Total={participating_count_total:.0f}/{participating_count_total+inactive_count_total:.0f} | "
 
                             f"L_total={row['L_total']:.4e} | "
                             f"L_vol={row['loss_vol']:.3e} "
@@ -6144,19 +6916,14 @@ class NN_Trainer:
                             f"L_rep={row['loss_rep']:.3e} "
                             f"L_bnd={row['loss_bnd']:.3e} "
                             f"L_curve={row['loss_curve_length']:.3e} "
-                            f"L(min/max/mean)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e} "
+                            f"L(min/max/mean/ratio)={row['curve_length_min']:.3e}/{row['curve_length_max']:.3e}/{row['curve_length_mean']:.3e}/{row['curve_length_ratio']:.2f} "
                             f"L_cell_edge={row['loss_cell_edge_uniform']:.3e} |"
-                            f"VF_total={row['VF_total']:.3f} "
-                            f"VF_eff_total={row['VF_eff_total']:.3f} "
-                            f"VF_int={row['VF_int']:.3f} "
-                            f"VF_eff_int={row['VF_eff_int']:.3f} "
+                            f"VolFrac={row['VolFrac']:.3f} "
                             f"(/{cfg.target_volfrac:.3f}) "
-                            f"tau={row['tau']:.3e} "
                             f"os={row['seed_offset_scale']:.2e} "
                             f"comp={row['comp']:.3e} | "
                             f"w={row['w_geo_mean']:.3e} "
                             f"clr={row['centerline_radius_mean']:.3e} "
-                            f"h={row['h_mean']:.3e} | "
                             f"rho(min/mean/max)={rho_min:.3f}/{rho_mean:.3f}/{rho_max:.3f} "
                             f"Δrho={drho:.2e} Δseed={dseed:.2e} "
                             f"dmin={min_seed_dist:.2e} grad_mean={g_mean:.2e} | "
@@ -6174,7 +6941,7 @@ class NN_Trainer:
 
                     rep_value = float(row["loss_rep"])
                     bnd_value = float(row["loss_bnd"])
-                    vol_eff_value = float(row["vol_frac_eff"])
+                    vol_eff_value = float(row["VolFrac"])
                     w_geo_value = float(row["w_geo_mean"])
                     min_seed_dist_value = float(row["min_seed_dist"])
                     min_seed_dist_limit = float(cfg.anchor_guard_min_seed_dist_factor) * float(cfg.w_min)
@@ -6267,7 +7034,7 @@ class NN_Trainer:
                             tqdm.write(
                                 f"Plateau reached at step {step}, but pruning was skipped: "
                                 f"removing {removed_count} inactive seeds would leave fewer than "
-                                f"min_active_seeds={int(cfg.min_active_seeds or 1)}."
+                                f"min_active_units={int(cfg.min_active_seeds or 1)}."
                             )
                         elif old_seed_count_current <= int(cfg.min_active_seeds or 1):
                             tqdm.write(
@@ -6290,11 +7057,34 @@ class NN_Trainer:
                 best_rho = rho.detach().clone()
                 best_seeds = [s.detach().clone() for s in seeds_list]
                 best_pred = self._clone_pred_list(pred_list)
+                best_fem_density_field = (
+                    fem_density_field.detach().clone()
+                    if isinstance(fem_density_field, torch.Tensor)
+                    else None
+                )
+                best_fem_stress_field = (
+                    fem_stress_field.detach().clone()
+                    if isinstance(fem_stress_field, torch.Tensor)
+                    else None
+                )
+                best_fem_displacement_field = (
+                    fem_displacement_field.detach().clone()
+                    if isinstance(fem_displacement_field, torch.Tensor)
+                    else None
+                )
                 best_step = step
                 best_score = float("inf") if not self._scalar_tensor_is_finite(L_total) else float(L_total.detach().item())
 
                 if best_vol_frac is None:
-                    best_vol_frac = float(vol_frac_eff.detach().item())
+                    best_vol_frac = float(
+                        (
+                            vol_frac_eff
+                            if bool(getattr(cfg, "use_effective_volume_constraint", True))
+                            else vol_frac
+                        )
+                        .detach()
+                        .item()
+                    )
                 if best_comp is None:
                     best_comp = float(comp_val.detach().item())
                 if best_w_geo is None:
@@ -6399,10 +7189,10 @@ class NN_Trainer:
 
         tqdm.write(
             f"FINAL RETURNED: best_step={best_step}, best_score={best_score:.6f} | "
-            f"VF_eff_int={best_vol_frac:.3e}, "
+            f"VolFrac={best_vol_frac:.3e}, "
             f"comp={best_comp:.3e}, w_geo={best_w_geo:.3e}, "
             f"centerline_radius={final_centerline_radius:.3e} | "
-            f"active={float(best_active_count or 0.0):.0f}, inactive={float(best_inactive_count or 0.0):.0f} | "
+            f"active_units={float(best_active_count or 0.0):.0f}, inactive_units={float(best_inactive_count or 0.0):.0f} | "
             f"source={returned_best_source} | "
             f"time={self._format_elapsed_time(computation_time_sec)}"
         )
@@ -6421,12 +7211,26 @@ class NN_Trainer:
 
         if best_row is not None:
             tqdm.write(
-                "BEST VOLUME METRICS: "
-                f"VF_total={best_row['VF_total']:.6g} | "
-                f"VF_eff_total={best_row['VF_eff_total']:.6g} | "
-                f"VF_int={best_row['VF_int']:.6g} | "
-                f"VF_eff_int={best_row['VF_eff_int']:.6g}"
+                "BEST VOLUME METRIC: "
+                f"VolFrac={best_row['VolFrac']:.6g}"
             )
+
+        solution_metric_keys = [
+            "minimum_length",
+            "maximum_length",
+            "mean_length",
+            "standard_deviation",
+            "coefficient_of_variation",
+            "maximum_minimum_ratio",
+            "minimum_seed_distance",
+            "number_of_edges",
+            "topology_identifier",
+        ]
+        best_solution_metrics = {
+            key: best_row.get(key)
+            for key in solution_metric_keys
+            if best_row is not None and key in best_row
+        }
 
         optimization_log_dir = None
         try:
@@ -6452,27 +7256,15 @@ class NN_Trainer:
                     else int(cfg.seed_number)
                 )
                 active_seed_count = int(round(float(best_active_count or 0.0)))
-                best_vol_total = (
-                    float(best_row["vol_frac"])
-                    if best_row is not None and "vol_frac" in best_row
+                best_volfrac = (
+                    float(best_row["VolFrac"])
+                    if best_row is not None and "VolFrac" in best_row
                     else float(best_vol_frac)
-                )
-                best_vol_internal = (
-                    float(best_row["vol_frac_internal"])
-                    if best_row is not None and "vol_frac_internal" in best_row
-                    else float(best_vol_frac)
-                )
-                best_vol_eff = float(best_vol_frac)
-                best_vol_eff_total = (
-                    float(best_row["VF_eff_total"])
-                    if best_row is not None and "VF_eff_total" in best_row
-                    else float("nan")
                 )
                 tuned_param_summary = {
                     "best_step": f"{int(best_step)}",
-                    "active_seeds": f"{active_seed_count}/{total_seed_slots}",
-                    "w": f"{float(best_w_geo):.6g}",
-                    "tau": f"{self._fallback_tau_value():.6g}",
+                    "active_units": f"{active_seed_count}/{total_seed_slots}",
+                    "w": f"{float(best_w_geo):.2f}",
                 }
                 if best_pred:
                     def _mean_from_best_pred(key):
@@ -6485,17 +7277,10 @@ class NN_Trainer:
                             return float(sum(vals) / len(vals))
                         return float("nan")
 
-                    tau_mean = _mean_from_best_pred("tau")
-                    h_mean = _mean_from_best_pred("h")
-
                     tuned_param_summary = {
                         "best_step": f"{int(best_step)}",
-                        "active_seeds": f"{active_seed_count}/{total_seed_slots}",
-                        "w": f"{float(best_w_geo):.6g}",
-                        "tau": (
-                            f"{(tau_mean if math.isfinite(tau_mean) else self._fallback_tau_value()):.6g}"
-                        ),
-                        "h": f"{h_mean:.6g}" if math.isfinite(h_mean) else "nan",
+                        "active_units": f"{active_seed_count}/{total_seed_slots}",
+                        "w": f"{float(best_w_geo):.2f}",
                     }
 
                 best_loss_dict = {
@@ -6508,11 +7293,9 @@ class NN_Trainer:
                     "L_CellEdge": float(best_row["loss_cell_edge_uniform"]) if best_row is not None else float("nan"),
                 }
                 results_text = (
-                    f"VF_total={best_vol_total:.6g} | "
-                    f"VF_eff_total={best_vol_eff_total:.6g} | "
-                    f"VF_int={best_vol_internal:.6g} | "
-                    f"VF_eff_int={best_vol_eff:.6g} | "
-                    f"fem={float(best_comp):.6g} | "
+                    f"VolFrac={best_volfrac:.2f} | "
+                    f"Best L_FEM={float(best_row['loss_fem']) if best_row is not None else float(best_comp):.2f} | "
+                    f"Com. Red. = {float(best_row['compliance_reduction_pct']) if best_row is not None else float('nan'):.1f}% | "
                     f"compute_time={self._format_elapsed_time(computation_time_sec)}"
                 )
                 tuned_param_title = " | ".join(f"{key}={value}" for key, value in tuned_param_summary.items())
@@ -6528,6 +7311,10 @@ class NN_Trainer:
                             pred_list=best_pred,
                             render_cache=render_cache,
                             loading_img=self.timelapse_loading_img,
+                            fem_density_field=best_fem_density_field,
+                            fem_stress_field=best_fem_stress_field,
+                            fem_displacement_field=best_fem_displacement_field,
+                            history_rows=history,
                         )
                     else:
                         best_cad_img = self._render_current_cad_frame_cached(
@@ -6599,12 +7386,13 @@ class NN_Trainer:
             "prune_events": prune_events,
             "best_score": best_score,
             "best_step": best_step,
-            "best_active_count": float(best_active_count or 0.0),
-            "best_inactive_count": float(best_inactive_count or 0.0),
+            "best_solution_metrics": best_solution_metrics,
+            "best_active_units": float(best_active_count or 0.0),
+            "best_inactive_units": float(best_inactive_count or 0.0),
             "best_hard_score": best_hard_score,
             "best_hard_step": best_hard_step,
-            "best_hard_active_count": float(best_hard_active_count or 0.0),
-            "best_hard_inactive_count": float(best_hard_inactive_count or 0.0),
+            "best_hard_active_units": float(best_hard_active_count or 0.0),
+            "best_hard_inactive_units": float(best_hard_inactive_count or 0.0),
             "returned_best_source": returned_best_source,
             "best_rho": best_rho,
             "best_seeds": best_seeds,

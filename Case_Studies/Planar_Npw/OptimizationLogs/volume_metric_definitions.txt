@@ -1,0 +1,3 @@
+Volume Metric Definitions
+=========================
+VolFrac: Material volume fraction used by the current method for optimization and reporting.
